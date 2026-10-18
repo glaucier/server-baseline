@@ -332,10 +332,12 @@ if [[ "$V6_ATIVAR" == sim ]]; then
     pergunta V6_BLOCO "Bloco IPv6 do provedor (opcional)" \
 "O bloco recebido do registro (ex.: o /32 do seu ASN no registro.br). Serve para conferir que o /64 abaixo é seu.
 Enter vazio = não conferir." "formato: xxxx:xxxx::/32" "$(p V6_BLOCO)" val_bloco sim
-    PREF_PADRAO=$(p V6_PREFIXO); [[ -z "$PREF_PADRAO" && -n "$V6_ANT" ]] && PREF_PADRAO=$(py_rede prefixo_de "$V6_ANT")
-    [[ -z "$PREF_PADRAO" ]] && PREF_PADRAO=$V6_DETECTADO
+    # O DETECTADO (evidência da rede) vem antes da resposta anterior: uma resposta errada salva não pode virar o padrão para sempre
+    PREF_ANT=$(p V6_PREFIXO); [[ -z "$PREF_ANT" && -n "$V6_ANT" ]] && PREF_ANT=$(py_rede prefixo_de "$V6_ANT")
+    PREF_PADRAO=${V6_DETECTADO:-$PREF_ANT}
     EXP="O /64 da rede em que este servidor está (o mesmo do gateway IPv6) — NÃO é o bloco /32 inteiro."
     [[ -n "$V6_DETECTADO" ]] && EXP+=$'\n'"Detectado: $V6_DETECTADO — por $V6_ORIGEM."
+    [[ -n "$PREF_ANT" && "$PREF_ANT" != "$PREF_PADRAO" ]] && EXP+=$'\n'"(Resposta anterior: $PREF_ANT — diferente do detectado; confira.)"
     pergunta V6_PREFIXO "Prefixo IPv6 /64 da rede dos servidores" "$EXP" "formato: xxxx:xxxx:xxxx:xxxx::/64" "$PREF_PADRAO" val_prefixo
     V6_SUG=$(py_rede deriva "$V6_PREFIXO" "$OCT") || V6_SUG=""
     [[ -n "$V6_ANT" && "$(py_rede prefixo_de "$V6_ANT")" == "$V6_PREFIXO" && "$(p HOSTNAME_)" == "$HOSTNAME_" ]] && V6_SUG=$V6_ANT
@@ -369,7 +371,8 @@ Enter vazio = não conferir." "formato: xxxx:xxxx::/32" "$(p V6_BLOCO)" val_bloc
       n) V6_ATIVAR=nao; break;;
     esac
     unset 'RESP[V6_BLOCO]' 'RESP[V6_PREFIXO]' 'RESP[V6]' 'RESP[V6_GW]'
-    PADRAO[V6_BLOCO]=$V6_BLOCO; PADRAO[V6_PREFIXO]=$V6_PREFIXO; PADRAO[V6_GW]=$V6_GW; V6_ANT=""   # correção: o que foi digitado vira o padrão
+    # Corrigir: o bloco digitado fica; prefixo, endereço e gateway voltam a ser sugeridos (detectado e derivados), não o que falhou
+    PADRAO[V6_BLOCO]=$V6_BLOCO; PADRAO[V6_PREFIXO]=""; PADRAO[V6_GW]=""; V6_ANT=""   # correção: o que foi digitado vira o padrão
   done
 fi
 if [[ "$V6_ATIVAR" != sim ]]; then V6=""; V6_GW=""; V6_PREFIXO=""; V6_BLOCO=""; V6_TESTE=""; fi
