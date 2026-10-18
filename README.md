@@ -12,7 +12,7 @@ portas no UFW; o baseline só mexe nas regras marcadas `# baseline:`.
 | Etapa | O que aplica |
 |---|---|
 | 1. Sistema | fuso horário, nome do servidor, `apt full-upgrade` (opcional), atualização automática diária **só de segurança, sem reboot automático**, no horário escolhido, com lista de pacotes que ela não toca (ex.: `unbound`) |
-| 2. IPv6 | endereço estático derivado do IPv4 (`<prefixo>::<último octeto>`), testado contra duplicidade (DAD) antes de gravar `/etc/netplan/60-ipv6.yaml` |
+| 2. IPv6 | sugere o /64 sozinho (prefixo anunciado pelo roteador, ou o AAAA de um vizinho da mesma rede IPv4 — ex.: o servidor DNS configurado), confere com o bloco do provedor, sugere `<prefixo>::<último octeto>` e **testa antes do resumo**: duplicidade (DAD) e resposta do gateway. Grava `/etc/netplan/60-ipv6.yaml` e já ativa, sem reboot |
 | 3. SSH + UFW | porta própria, só chave, sem root; UFW nega a entrada e libera o SSH só para as redes de gestão. **Volta automática**: se o novo acesso não for confirmado em 5 minutos, SSH e UFW voltam ao que eram |
 | 4. SNMPv3 | somente leitura, `authPriv` (SHA-256/AES), sem community; porta 161 só para o monitoramento |
 
@@ -47,6 +47,12 @@ Depois:
 sudo reboot
 sudo baseline-verify          # só leitura; saída 0 = tudo OK
 ```
+
+## Listas de IPs/redes
+
+Gestão do SSH e origens do SNMP são perguntadas **um item por vez**: digite um IP (`a.b.c.d`) ou uma rede
+(`a.b.c.0/24`) e Enter; repita para o próximo; **Enter vazio conclui**. Também aceita vários de uma vez,
+separados por espaço ou vírgula. `limpar` recomeça a lista. Endereços de exemplo/documentação são recusados.
 
 ## Vários servidores
 

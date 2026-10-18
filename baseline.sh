@@ -40,7 +40,7 @@ ajuda() {
   cat <<'EOF'
 Arquivo de respostas: o mesmo formato de /root/baseline.env (CHAVE="valor", uma por linha).
 O /root/baseline.env de um servidor serve de modelo para o próximo (troque HOSTNAME_ e V6).
-Chaves: TZ_ HOSTNAME_ ATUALIZAR_AGORA HORA ATUALIZA_SEGURAR V6_ATIVAR V6_PREFIXO V6 V6_GW
+Chaves: TZ_ HOSTNAME_ ATUALIZAR_AGORA HORA ATUALIZA_SEGURAR V6_ATIVAR V6_BLOCO V6_PREFIXO V6 V6_GW
         ADMIN_USER PUBKEY SSH_PORT GESTAO_SSH SNMP SNMP_ORIGENS SNMP_USER SNMP_LOCATION SNMP_CONTACT
 EOF
 }
@@ -66,24 +66,46 @@ ler_kv() { # $1 = arquivo, $2 = nome do array associativo
 # ---- Validação (Python ipaddress; o valor vai por argumento, nunca dentro do código) -----------
 VALOR=""
 py_rede() { python3 -I - "$@" <<'PY'
-import ipaddress, sys
+import ipaddress, socket, sys
 tipo, v = sys.argv[1], sys.argv[2].strip()
+DOC = [ipaddress.ip_network(x) for x in ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24", "2001:db8::/32")]
+def sem_doc(obj):                                # endereço de DOCUMENTAÇÃO (RFC 5737/3849) = o exemplo copiado
+    n = obj if isinstance(obj, (ipaddress.IPv4Network, ipaddress.IPv6Network)) else ipaddress.ip_network(obj)
+    if any(n.version == d.version and n.overlaps(d) for d in DOC):
+        print("    isso é um endereço de EXEMPLO (documentação), não de uma rede real — use o da sua rede", file=sys.stderr)
+        sys.exit(1)
+    return obj
 try:
     if tipo == "ipv4":
-        print(ipaddress.IPv4Address(v))
+        print(sem_doc(ipaddress.IPv4Address(v)))
     elif tipo == "ipv6":
-        a = ipaddress.IPv6Address(v)
+        a = sem_doc(ipaddress.IPv6Address(v))
         if a.is_link_local or a.is_loopback or a.is_multicast or a.is_unspecified: sys.exit(1)
         print(a.compressed)
     elif tipo == "rede":                         # IP ou rede (v4/v6) para o UFW
-        n = ipaddress.ip_network(v, strict=False)
+        n = sem_doc(ipaddress.ip_network(v, strict=False))
         if n.prefixlen == 0: sys.exit(1)         # 0.0.0.0/0 não é "rede de gestão"
         print(n.network_address.compressed if n.num_addresses == 1 else n.with_prefixlen)
-    elif tipo == "prefixo64":                    # aceita 2001:db8:100:1 ou 2001:db8:100:1::/64
+    elif tipo == "prefixo64":                    # aceita 2804:db8:100:1 ou …::/64
         t = v if "/" in v else v.rstrip(":") + "::/64"
-        n = ipaddress.IPv6Network(t, strict=False)
-        if n.prefixlen != 64: sys.exit(1)
+        n = sem_doc(ipaddress.IPv6Network(t, strict=False))
+        if n.prefixlen != 64:
+            print("    o prefixo da rede dos servidores é um /64 (o /32 ou /48 é o BLOCO do provedor)", file=sys.stderr); sys.exit(1)
         print(n.with_prefixlen)
+    elif tipo == "bloco":                        # bloco IPv6 do provedor (/16 a /64)
+        n = sem_doc(ipaddress.IPv6Network(v, strict=False))
+        if not 16 <= n.prefixlen <= 64: sys.exit(1)
+        print(n.with_prefixlen)
+    elif tipo == "dentro":                       # rede $2 está dentro do bloco $3?
+        sys.exit(0 if ipaddress.ip_network(v).subnet_of(ipaddress.ip_network(sys.argv[3])) else 1)
+    elif tipo == "vizinho":                      # IPv4 → nome (PTR) → AAAA global: "nome aaaa"
+        socket.setdefaulttimeout(4)
+        nome = socket.gethostbyaddr(v)[0]
+        for f in socket.getaddrinfo(nome, None, socket.AF_INET6):
+            a = ipaddress.IPv6Address(f[4][0].split("%")[0])
+            if a.is_global and a.ipv4_mapped is None:
+                print(nome, a.compressed); sys.exit(0)
+        sys.exit(1)
     elif tipo == "deriva":                       # prefixo/64 + texto (ex. "12") lido como hexadecimal
         n = ipaddress.IPv6Network(v); suf = int(sys.argv[3], 16)
         print(ipaddress.IPv6Address(int(n.network_address) + suf).compressed)
@@ -94,13 +116,17 @@ try:
         sys.exit(0 if any(ip in ipaddress.ip_network(r, strict=False) for r in sys.argv[3:]) else 1)
     else:
         sys.exit(2)
-except (ValueError, IndexError):
+except (ValueError, IndexError, OSError):
     sys.exit(1)
 PY
 }
 
 val_ipv6()     { VALOR=$(py_rede ipv6 "$1"); }
-val_prefixo()  { VALOR=$(py_rede prefixo64 "$1"); }
+val_bloco()    { VALOR=$(py_rede bloco "$1"); }
+val_prefixo()  { # /64 e, se o bloco do provedor foi informado, dentro dele
+  VALOR=$(py_rede prefixo64 "$1") || return 1
+  [[ -z "${V6_BLOCO:-}" ]] && return 0
+  py_rede dentro "$VALOR" "$V6_BLOCO" || { echo "    $VALOR não está dentro do bloco $V6_BLOCO"; return 1; }; }
 val_hora()     { [[ "$1" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] && VALOR="$1"; }
 val_porta()    { [[ "$1" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )) && VALOR=$((10#$1)); }
 val_tz()       { timedatectl list-timezones 2>/dev/null | grep -qxF -- "$1" && VALOR="$1"; }
@@ -132,7 +158,7 @@ pergunta() {
   echo
   echo -e "\e[1m$titulo\e[0m"
   [[ -n "$expl" ]] && echo "$expl" | sed 's/^/  /'
-  [[ -n "$exemplo" ]] && echo "  Exemplo: $exemplo"
+  if [[ "$exemplo" == formato:* ]]; then echo "  Formato:${exemplo#formato:}"; elif [[ -n "$exemplo" ]]; then echo "  Exemplo: $exemplo"; fi
   while :; do
     read -rp "  > [${padrao:-vazio}]: " r </dev/tty
     r=${r:-$padrao}
@@ -145,6 +171,40 @@ pergunta() {
   done
 }
 
+# lista_redes VAR "Título" "Explicação" "lista padrão" — um IP/rede por vez (ou vários de uma vez), Enter vazio conclui
+lista_redes() {
+  local var=$1 titulo=$2 expl=$3 padrao=$4 r n novo
+  local -a lista=()
+  if [[ -n "${RESP[$var]+x}" ]]; then
+    val_redes "${RESP[$var]}" || pare "$var=\"${RESP[$var]}\" do arquivo de respostas é inválido — $titulo"
+    printf -v "$var" '%s' "$VALOR"; echo "  $titulo: $VALOR   (arquivo de respostas)"; return 0
+  fi
+  for r in $padrao; do n=$(py_rede rede "$r" 2>/dev/null) && lista+=("$n"); done
+  echo
+  echo -e "\e[1m$titulo\e[0m"
+  [[ -n "$expl" ]] && echo "$expl" | sed 's/^/  /'
+  echo "  Digite UM IP ou rede e Enter; repita para adicionar outro (ou vários de uma vez, separados por espaço ou vírgula)."
+  echo "  Formato: a.b.c.d (um host) ou a.b.c.0/24 (uma rede); IPv6 também vale. Enter vazio = concluir. 'limpar' = recomeçar."
+  while :; do
+    if (( ${#lista[@]} )); then echo "  Lista (${#lista[@]}): ${lista[*]}"; else echo "  Lista: (vazia)"; fi
+    read -rp "  Adicionar: " r </dev/tty
+    r=${r//,/ }
+    if [[ -z "${r// /}" ]]; then (( ${#lista[@]} )) && break; echo "    Informe pelo menos um."; continue; fi
+    if [[ "${r,,}" == limpar ]]; then lista=(); continue; fi
+    for novo in $r; do
+      if n=$(py_rede rede "$novo"); then
+        if [[ " ${lista[*]} " == *" $n "* ]]; then echo "    $n já está na lista"; else lista+=("$n"); fi
+      else
+        echo "    \"$novo\" não é IP nem rede válida — ignorado"
+      fi
+    done
+  done
+  printf -v "$var" '%s' "${lista[*]}"
+}
+
+# Descarta o que foi digitado durante etapas longas (ex.: Enter apertado durante o apt), para não virar resposta
+limpar_teclado() { local _l; while read -r -t 0.2 -n 256 _l </dev/tty 2>/dev/null; do :; done; }
+
 ler_senha() { # $1 = rótulo ; resultado em SENHA (só interativo)
   local s1 s2
   while :; do
@@ -155,6 +215,21 @@ ler_senha() { # $1 = rótulo ; resultado em SENHA (só interativo)
     [[ "$s1" == *[[:space:]\"\'\\\$\`]* ]] && { echo "    Caractere não permitido."; continue; }
     SENHA=$s1; break
   done
+}
+
+# Respostas SEM senha → /root/baseline.env (padrão da próxima execução e modelo para --respostas)
+salvar_env() {
+  local k v
+  {
+    echo "# Gerado por baseline v$VERSAO em $(date '+%F %T') — SEM senhas. Serve de padrão para a próxima execução"
+    echo "# e de modelo (--respostas) para outro servidor (troque HOSTNAME_ e V6)."
+    for k in BASELINE_VERSAO TZ_ HOSTNAME_ ATUALIZAR_AGORA HORA ATUALIZA_SEGURAR IF V4 V4_GW V6_ATIVAR V6_BLOCO V6_PREFIXO V6 V6_GW \
+             ADMIN_USER PUBKEY_FPS SSH_PORT GESTAO_SSH SNMP SNMP_ORIGENS SNMP_USER SNMP_LOCATION SNMP_CONTACT; do
+      case $k in BASELINE_VERSAO) v=$VERSAO;; *) v=${!k:-};; esac
+      printf '%s="%s"\n' "$k" "$v"
+    done
+  } > "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
 }
 
 # ---- Argumentos ---------------------------------------------------------------------------------
@@ -231,25 +306,84 @@ pergunta ATUALIZA_SEGURAR "Pacotes que a atualização automática NÃO deve toc
 Enter vazio = nenhum." "unbound" "$(p ATUALIZA_SEGURAR)" val_pacotes sim
 
 info "IPv6"
-V6_ATUAL=$(ip -6 -o addr show dev "$IF" scope global 2>/dev/null | awk '$0 !~ /temporary|dynamic/ {print $4; exit}')
-if [[ -n "$V6_ATUAL" ]]; then echo "  IPv6 global já presente em $IF: $V6_ATUAL"; fi
-pergunta V6_ATIVAR "Configurar IPv6 estático nesta interface?" \
-"O endereço é derivado do IPv4 (último octeto). Responda n se não houver IPv6 nesta rede." "s" "$(p V6_ATIVAR "$( [[ -n "$(p V6)" ]] && echo sim || echo nao )")" val_simnao
-if [[ "$V6_ATIVAR" == sim ]]; then
-  PREF_PADRAO=$(p V6_PREFIXO); [[ -z "$PREF_PADRAO" && -n "$(p V6)" ]] && PREF_PADRAO=$(py_rede prefixo_de "$(p V6)")
-  pergunta V6_PREFIXO "Prefixo IPv6 /64 da rede dos servidores" "O mesmo /64 em que está o gateway IPv6." "2001:db8:100:1::/64" "$PREF_PADRAO" val_prefixo
-  V6_SUG=$(py_rede deriva "$V6_PREFIXO" "$OCT") || V6_SUG=""
-  [[ -n "$(p V6)" && "$(py_rede prefixo_de "$(p V6)")" == "$V6_PREFIXO" && "$(p HOSTNAME_)" == "$HOSTNAME_" ]] && V6_SUG=$(p V6)
-  pergunta V6 "IPv6 deste servidor" "Sugestão: prefixo + o último octeto do IPv4 ($OCT) escrito igual." "${V6_PREFIXO%%::*}::$OCT" "$V6_SUG" val_ipv6
-  [[ "$(py_rede prefixo_de "$V6")" == "$V6_PREFIXO" ]] || pare "O IPv6 $V6 não está no prefixo $V6_PREFIXO"
-  GW_SUG=$(p V6_GW); [[ -z "$GW_SUG" || "$(py_rede prefixo_de "$GW_SUG" 2>/dev/null)" != "$V6_PREFIXO" ]] && GW_SUG=$(py_rede deriva "$V6_PREFIXO" 1)
-  pergunta V6_GW "Gateway IPv6" "Normalmente o ::1 do prefixo." "${V6_PREFIXO%%::*}::1" "$GW_SUG" val_ipv6
-else
-  V6=""; V6_GW=""; V6_PREFIXO=""
+# Sugestão do /64, sem inventar: 1) prefixo anunciado pelo roteador (SLAAC); 2) vizinho da MESMA rede IPv4 com AAAA no DNS
+# (servidores DNS configurados e o gateway: IPv4 → nome reverso → AAAA). Não há regra universal IPv4 → IPv6: é o plano do provedor.
+V6_DETECTADO=""; V6_ORIGEM=""; VIZ_SUF=""
+x=$(ip -6 -o addr show dev "$IF" scope global 2>/dev/null | awk '/dynamic/{print $4; exit}')
+if [[ -n "$x" ]] && V6_DETECTADO=$(py_rede prefixo_de "${x%/*}" 2>/dev/null); then V6_ORIGEM="anúncio do roteador (SLAAC $x)"; fi
+if [[ -z "$V6_DETECTADO" ]]; then
+  for ip in $( { resolvectl dns "$IF" 2>/dev/null | sed 's/^[^:]*://'; echo "$V4_GW"; } | tr ' ' '\n' | grep -E '^[0-9]+(\.[0-9]+){3}$' | sort -u); do
+    py_rede contem "$ip" "$V4_CIDR" || continue
+    r=$(py_rede vizinho "$ip" 2>/dev/null) || continue
+    if V6_DETECTADO=$(py_rede prefixo_de "${r#* }" 2>/dev/null); then
+      V6_ORIGEM="${r% *} ($ip → ${r#* }), na mesma rede IPv4 deste servidor"
+      [[ "${r#* }" == *"::${ip##*.}" ]] && VIZ_SUF=sim     # o vizinho segue a convenção ::<último octeto>
+      break
+    fi
+  done
 fi
+V6_ANT=$(p V6)
+pergunta V6_ATIVAR "Configurar IPv6 estático nesta interface?" \
+"O endereço sugerido usa o último octeto do IPv4. Responda n se esta rede não tem IPv6." "" \
+"$(p V6_ATIVAR "$( [[ -n "$V6_ANT$V6_DETECTADO" ]] && echo sim || echo nao )")" val_simnao
+V6_TESTE=""
+if [[ "$V6_ATIVAR" == sim ]]; then
+  while :; do
+    pergunta V6_BLOCO "Bloco IPv6 do provedor (opcional)" \
+"O bloco recebido do registro (ex.: o /32 do seu ASN no registro.br). Serve para conferir que o /64 abaixo é seu.
+Enter vazio = não conferir." "formato: xxxx:xxxx::/32" "$(p V6_BLOCO)" val_bloco sim
+    PREF_PADRAO=$(p V6_PREFIXO); [[ -z "$PREF_PADRAO" && -n "$V6_ANT" ]] && PREF_PADRAO=$(py_rede prefixo_de "$V6_ANT")
+    [[ -z "$PREF_PADRAO" ]] && PREF_PADRAO=$V6_DETECTADO
+    EXP="O /64 da rede em que este servidor está (o mesmo do gateway IPv6) — NÃO é o bloco /32 inteiro."
+    [[ -n "$V6_DETECTADO" ]] && EXP+=$'\n'"Detectado: $V6_DETECTADO — por $V6_ORIGEM."
+    pergunta V6_PREFIXO "Prefixo IPv6 /64 da rede dos servidores" "$EXP" "formato: xxxx:xxxx:xxxx:xxxx::/64" "$PREF_PADRAO" val_prefixo
+    V6_SUG=$(py_rede deriva "$V6_PREFIXO" "$OCT") || V6_SUG=""
+    [[ -n "$V6_ANT" && "$(py_rede prefixo_de "$V6_ANT")" == "$V6_PREFIXO" && "$(p HOSTNAME_)" == "$HOSTNAME_" ]] && V6_SUG=$V6_ANT
+    EXP="Sugestão: o prefixo + o último octeto do IPv4 ($OCT), escrito igual."
+    [[ "$VIZ_SUF" == sim ]] && EXP+=" É a mesma regra do vizinho detectado."
+    pergunta V6 "IPv6 deste servidor" "$EXP" "" "$V6_SUG" val_ipv6
+    if [[ "$(py_rede prefixo_de "$V6")" != "$V6_PREFIXO" ]]; then echo "    $V6 não está no prefixo $V6_PREFIXO"; [[ -n "${RESP[V6]+x}" ]] && pare "V6 fora do V6_PREFIXO no arquivo de respostas"; continue; fi
+    GW_SUG=$(p V6_GW); [[ -z "$GW_SUG" || "$(py_rede prefixo_de "$GW_SUG" 2>/dev/null)" != "$V6_PREFIXO" ]] && GW_SUG=$(py_rede deriva "$V6_PREFIXO" 1)
+    pergunta V6_GW "Gateway IPv6" "Normalmente o ::1 do prefixo." "" "$GW_SUG" val_ipv6
+    # Teste real, ANTES do resumo: o endereço entra por instantes na interface (o kernel testa duplicidade — DAD) e o gateway
+    # precisa responder. Depois o endereço sai de novo (se não estava). Pega prefixo/gateway errados antes de gravar.
+    echo "  Testando $V6 (duplicidade) e o gateway $V6_GW…"
+    JA=0; ip -6 addr show dev "$IF" | grep -qi " $V6/64" && JA=1
+    RC=0
+    if (( ! JA )); then
+      ip -6 addr add "$V6/64" dev "$IF" 2>/dev/null; sleep 3
+      if ip -6 addr show dev "$IF" | grep -i " $V6/64" | grep -q dadfailed; then RC=2; fi
+    fi
+    if (( RC == 0 )); then ping -6 -c3 -W2 -I "$IF" "$V6_GW" >/dev/null 2>&1 || RC=1; fi
+    (( JA )) || ip -6 addr del "$V6/64" dev "$IF" 2>/dev/null
+    case $RC in
+      0) V6_TESTE="ok: endereço livre e gateway respondeu"; ok "$V6 livre e o gateway $V6_GW respondeu"; break;;
+      2) V6_TESTE=""; echo -e "  \e[31m$V6 JÁ ESTÁ EM USO por outro equipamento desta rede (DAD).\e[0m";;
+      1) V6_TESTE="AVISO: gateway não respondeu ao ping"; aviso "O gateway $V6_GW NÃO respondeu. Prefixo ou gateway errados? (ou o gateway não responde a ping)";;
+    esac
+    if [[ -n "${RESP[V6]+x}" ]]; then (( RC == 2 )) && pare "IPv6 do arquivo de respostas em uso por outro equipamento"; break; fi
+    if (( RC == 1 )); then read -rp "  [c]orrigir, [s]eguir assim mesmo ou [n]ão configurar IPv6? (c/s/n) [c]: " r </dev/tty
+    else read -rp "  [c]orrigir ou [n]ão configurar IPv6? (c/n) [c]: " r </dev/tty; fi
+    case "${r,,}" in
+      s) (( RC == 1 )) && break;;
+      n) V6_ATIVAR=nao; break;;
+    esac
+    unset 'RESP[V6_BLOCO]' 'RESP[V6_PREFIXO]' 'RESP[V6]' 'RESP[V6_GW]'
+    PADRAO[V6_BLOCO]=$V6_BLOCO; PADRAO[V6_PREFIXO]=$V6_PREFIXO; PADRAO[V6_GW]=$V6_GW; V6_ANT=""   # correção: o que foi digitado vira o padrão
+  done
+fi
+if [[ "$V6_ATIVAR" != sim ]]; then V6=""; V6_GW=""; V6_PREFIXO=""; V6_BLOCO=""; V6_TESTE=""; fi
 
 info "Acesso SSH"
-pergunta ADMIN_USER "Usuário administrador (precisa existir e ter sudo)" "O usuário criado na instalação do Ubuntu." "admin" "$(p ADMIN_USER "${SUDO_USER:-}")" val_usuario
+ADM_PADRAO=$(p ADMIN_USER)
+if [[ -z "$ADM_PADRAO" ]]; then
+  for c in "${SUDO_USER:-}" "$(logname 2>/dev/null)" "$(who -m 2>/dev/null | awk '{print $1}')"; do
+    [[ -n "$c" && "$c" != root ]] && id "$c" >/dev/null 2>&1 && { ADM_PADRAO=$c; break; }
+  done
+  [[ -z "$ADM_PADRAO" ]] && ADM_PADRAO=$(getent group sudo | cut -d: -f4 | cut -d, -f1)
+fi
+pergunta ADMIN_USER "Usuário administrador (precisa existir e ter sudo)" "O usuário criado na instalação do Ubuntu (não use root)." "" "$ADM_PADRAO" val_usuario
+[[ "$ADMIN_USER" == root ]] && pare "O administrador não pode ser root: o login de root por SSH será desligado."
 id -nG "$ADMIN_USER" | grep -qw sudo || aviso "$ADMIN_USER não está no grupo sudo — sem ele, depois do baseline você não terá root (sem login de root por SSH)."
 H=$(getent passwd "$ADMIN_USER" | cut -d: -f6)
 AK="$H/.ssh/authorized_keys"
@@ -259,7 +393,7 @@ if [[ -n "${RESP[PUBKEY]+x}" ]]; then
   PUBKEY=${RESP[PUBKEY]}
 elif [[ -n "$FPS_ATUAIS" ]]; then
   echo; echo "  Chaves já autorizadas para $ADMIN_USER:"; ssh-keygen -lf "$AK" 2>/dev/null | sed 's/^/    /'
-  read -rp "  Adicionar outra chave pública? (s/N): " r </dev/tty
+  read -rp "  Adicionar outra chave pública? (s/N): " r </dev/tty; r=${r:-n}
   [[ "${r,,}" =~ ^s ]] && read -rp "  Cole a chave pública (uma linha, ssh-ed25519 …): " PUBKEY </dev/tty
 else
   echo; echo -e "\e[1mChave pública SSH do administrador\e[0m"
@@ -280,9 +414,8 @@ fi
 [[ -n "$FPS_ATUAIS$NOVO_FP" ]] || pare "Nenhuma chave SSH para $ADMIN_USER — sem chave, desligar a senha trancaria você fora."
 
 pergunta SSH_PORT "Porta do SSH" "Evite a 22 (alvo de varredura automática)." "44320" "$(p SSH_PORT 44320)" val_porta
-pergunta GESTAO_SSH "IPs/redes que podem acessar o SSH (gestão)" \
-"Só estes passam no firewall para o SSH. Separe por espaço. Aceita IPv4, IPv6 e redes com /máscara." \
-"192.0.2.10 198.51.100.0/24 2001:db8::/48" "$(p GESTAO_SSH "$CLIENTE_SSH")" val_redes
+lista_redes GESTAO_SSH "IPs/redes que podem acessar o SSH (gestão)" \
+"Só estes passam no firewall para o SSH: o seu computador, a VPN de gestão, o servidor de backup…" "$(p GESTAO_SSH "$CLIENTE_SSH")"
 if [[ -n "$CLIENTE_SSH" ]] && ! py_rede contem "$CLIENTE_SSH" $GESTAO_SSH; then
   aviso "Você está conectado de $CLIENTE_SSH, que NÃO está na lista de gestão."
   read -rp "  Incluir $CLIENTE_SSH na gestão? (S/n): " r </dev/tty
@@ -293,10 +426,10 @@ info "SNMP"
 pergunta SNMP "Configurar SNMPv3 (monitoramento, ex.: PRTG, Zabbix, LibreNMS)?" "Somente leitura, com usuário e duas senhas; sem community v1/v2c." "s" "$(p SNMP sim)" val_simnao
 AUTH=""; PRIV=""; SNMP_TROCA_SENHA=nao
 if [[ "$SNMP" == sim ]]; then
-  pergunta SNMP_ORIGENS "IPs/redes do servidor de monitoramento" "Só estes consultam a porta 161/udp." "192.0.2.51" "$(p SNMP_ORIGENS)" val_redes
-  pergunta SNMP_USER "Usuário SNMPv3" "O mesmo cadastrado no sensor do monitoramento." "monitorv3" "$(p SNMP_USER)" val_texto
-  pergunta SNMP_LOCATION "Localização (sysLocation)" "Onde o servidor está; aparece no monitoramento." "Datacenter_Central" "$(p SNMP_LOCATION)" val_texto
-  pergunta SNMP_CONTACT "Contato (sysContact)" "E-mail do responsável." "suporte@exemplo.com.br" "$(p SNMP_CONTACT)" val_texto
+  lista_redes SNMP_ORIGENS "IPs/redes do servidor de monitoramento" "Só estes consultam a porta 161/udp (ex.: o PRTG)." "$(p SNMP_ORIGENS)"
+  pergunta SNMP_USER "Usuário SNMPv3" "O mesmo cadastrado no sensor do monitoramento." "" "$(p SNMP_USER)" val_texto
+  pergunta SNMP_LOCATION "Localização (sysLocation)" "Onde o servidor está; aparece no monitoramento (sem espaço é mais seguro)." "Sala_Servidores" "$(p SNMP_LOCATION)" val_texto
+  pergunta SNMP_CONTACT "Contato (sysContact)" "E-mail do responsável." "suporte@seudominio" "$(p SNMP_CONTACT)" val_texto
   TEM_USM=$(grep -c '^usmUser' /var/lib/snmp/snmpd.conf 2>/dev/null); TEM_USM=${TEM_USM:-0}
   if (( TEM_USM > 0 )) && [[ "$(p SNMP_USER)" == "$SNMP_USER" ]]; then
     read -rp "  O usuário $SNMP_USER já existe. Trocar as senhas? (s/N): " r </dev/tty
@@ -328,7 +461,7 @@ echo "  Fuso / nome ........: $TZ_ / $HOSTNAME_"
 echo "  Atualizar agora ....: $ATUALIZAR_AGORA"
 echo "  Atualização auto ...: todo dia às $HORA (só segurança, sem reboot automático)"
 echo "  Fora da auto .......: ${ATUALIZA_SEGURAR:-(nenhum)}"
-if [[ -n "$V6" ]]; then echo "  IPv6 ...............: $V6/64  gateway $V6_GW  ($IF)"; else echo "  IPv6 ...............: não configurar"; fi
+if [[ -n "$V6" ]]; then echo "  IPv6 ...............: $V6/64  gateway $V6_GW  ($IF)${V6_BLOCO:+  bloco $V6_BLOCO}"; echo "                        teste: $V6_TESTE"; else echo "  IPv6 ...............: não configurar"; fi
 echo "  SSH ................: porta $SSH_PORT, só chave, sem root, usuário $ADMIN_USER"
 [[ -n "$NOVO_FP" ]] && echo "  Chave nova .........: $NOVO_FP"
 echo "  UFW (entrada) ......: negar tudo, exceto:"
@@ -341,8 +474,11 @@ if [[ "$SNMP" == sim ]]; then
 fi
 echo "  Proteção ...........: se o novo acesso SSH não for confirmado em $VOLTA_MIN min, SSH e UFW voltam sozinhos"
 echo "  Cópias .............: $BK"
+limpar_teclado
 read -rp "Aplicar? (s/N): " C </dev/tty
 [[ "${C,,}" =~ ^s ]] || pare "Cancelado (nada foi alterado)"
+PUBKEY_FPS=$(echo $FPS_ATUAIS $NOVO_FP | tr ' ' '\n' | sort -u | tr '\n' ' '); PUBKEY_FPS=${PUBKEY_FPS% }
+salvar_env
 
 mkdir -p "$BK"
 cp -a /etc/ssh/sshd_config.d "$BK/sshd_config.d" 2>/dev/null
@@ -398,14 +534,8 @@ systemctl daemon-reload && systemctl enable apt-daily.timer apt-daily-upgrade.ti
 # =================================================================================================
 info "2/4 IPv6"
 if [[ -n "$V6" ]]; then
-  # Duplicidade: o kernel testa o endereço (DAD) antes de usá-lo. Se outro host já o usa → "dadfailed".
-  if ! ip -6 addr show dev "$IF" | grep -qi " $V6/64"; then
-    ip -6 addr add "$V6/64" dev "$IF" 2>/dev/null && sleep 3
-    if ip -6 addr show dev "$IF" | grep -i " $V6/64" | grep -q dadfailed; then
-      ip -6 addr del "$V6/64" dev "$IF" 2>/dev/null
-      pare "O IPv6 $V6 JÁ ESTÁ EM USO por outro equipamento nesta rede (DAD). Escolha outro e rode de novo."
-    fi
-    ok "IPv6 $V6 livre na rede (teste de duplicidade)"
+  if [[ -n "$(p V6)" && "$(p V6)" != "$V6" ]] && ip -6 addr show dev "$IF" | grep -qi " $(p V6)/64"; then
+    ip -6 addr del "$(p V6)/64" dev "$IF" 2>/dev/null && ok "IPv6 anterior $(p V6) retirado da interface"
   fi
   cat > /etc/netplan/60-ipv6.yaml <<EOF
 # Gerado por baseline v$VERSAO — IPv6 estático
@@ -425,7 +555,9 @@ EOF
     [[ -f "$BK/netplan/60-ipv6.yaml" ]] && cp -a "$BK/netplan/60-ipv6.yaml" /etc/netplan/
     pare "netplan generate reprovou /etc/netplan/60-ipv6.yaml (desfeito)"
   fi
-  ok "/etc/netplan/60-ipv6.yaml gravado (rota padrão IPv6 vale após o reboot)"
+  ok "/etc/netplan/60-ipv6.yaml gravado (vale também após o reboot)"
+  ip -6 addr show dev "$IF" | grep -qi " $V6/64" || ip -6 addr add "$V6/64" dev "$IF" 2>/dev/null
+  ip -6 route replace default via "$V6_GW" dev "$IF" 2>/dev/null && ok "IPv6 ativo agora: $V6, rota padrão via $V6_GW"
 else
   ok "IPv6: nada a fazer"
 fi
@@ -507,13 +639,23 @@ echo
 echo -e "\e[1;33m  CONFIRMAÇÃO OBRIGATÓRIA — não feche esta janela.\e[0m"
 echo "  Abra uma conexão SSH NOVA:  $ADMIN_USER@$V4  porta $SSH_PORT  (com a chave)"
 echo "  Conseguiu entrar? Digite OK. Sem OK em $VOLTA_MIN min, SSH e UFW voltam ao que eram."
-CONF=""
-read -t $(( VOLTA_MIN * 60 - 20 )) -rp "  > " CONF </dev/tty || true
+echo "  Não entrou? Digite NAO para voltar agora."
+CONF=""; LIMITE=$(( $(date +%s) + VOLTA_MIN * 60 - 20 ))
+limpar_teclado
+while :; do
+  RESTA=$(( LIMITE - $(date +%s) )); (( RESTA > 0 )) || { CONF=""; break; }
+  read -t "$RESTA" -rp "  [OK/NAO] (${RESTA}s) > " CONF </dev/tty || { CONF=""; break; }
+  case "${CONF^^}" in
+    OK) break;;
+    NAO|NÃO|N) CONF=NAO; break;;
+    *) echo "    Digite OK (entrou pela porta $SSH_PORT) ou NAO (não entrou — volta agora).";;
+  esac
+done
 if [[ "${CONF^^}" == OK ]]; then
   systemctl stop "$VOLTA_UNIT.timer" 2>/dev/null; systemctl reset-failed "$VOLTA_UNIT" 2>/dev/null
   ok "Acesso confirmado — volta automática desarmada"
 else
-  echo "  Sem confirmação: aplicando a volta AGORA."
+  [[ "$CONF" == NAO ]] && echo "  Você respondeu NAO: aplicando a volta AGORA." || echo "  Prazo esgotado sem OK: aplicando a volta AGORA."
   systemctl stop "$VOLTA_UNIT.timer" 2>/dev/null; bash "$BK/volta.sh"
   pare "SSH e UFW restaurados. Confira chave, porta e lista de gestão e rode de novo. (Sistema e IPv6 já aplicados.)"
 fi
@@ -561,16 +703,7 @@ fi
 # =================================================================================================
 # REGISTRO (sem senhas) e instalação dos comandos
 # =================================================================================================
-{
-  echo "# Gerado por baseline v$VERSAO em $(date '+%F %T') — SEM senhas. Serve de padrão para a próxima execução"
-  echo "# e de modelo (--respostas) para outro servidor (troque HOSTNAME_ e V6)."
-  for k in BASELINE_VERSAO TZ_ HOSTNAME_ ATUALIZAR_AGORA HORA ATUALIZA_SEGURAR IF V4 V4_GW V6_ATIVAR V6_PREFIXO V6 V6_GW \
-           ADMIN_USER PUBKEY_FPS SSH_PORT GESTAO_SSH SNMP SNMP_ORIGENS SNMP_USER SNMP_LOCATION SNMP_CONTACT; do
-    case $k in BASELINE_VERSAO) v=$VERSAO;; *) v=${!k};; esac
-    printf '%s="%s"\n' "$k" "$v"
-  done
-} > "$ENV_FILE"
-chmod 600 "$ENV_FILE"
+salvar_env
 
 AQUI=$(dirname "$(readlink -f "$0")")
 [[ "$(readlink -f "$0")" == /usr/local/sbin/baseline ]] || install -m 700 "$(readlink -f "$0")" /usr/local/sbin/baseline
