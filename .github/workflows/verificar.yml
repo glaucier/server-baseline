@@ -1,0 +1,24 @@
+# Confere os scripts a cada PR/push: sintaxe (bash -n) e ShellCheck (avisos reprovam).
+# Sem actions de terceiros, sem segredos, só leitura.
+name: verificar
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  shellcheck:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Baixar o código (sem action de terceiros)
+        run: |
+          git init -q .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}"
+          git fetch -q --depth 1 origin "${GITHUB_REF}"
+          git checkout -q FETCH_HEAD
+      - name: Sintaxe
+        run: for f in *.sh; do bash -n "$f" && echo "ok $f"; done
+      - name: ShellCheck
+        run: shellcheck --version && shellcheck -S warning *.sh
