@@ -4,7 +4,7 @@
 #
 #   1. Sistema: fuso horário, nome do servidor, atualização e atualização automática
 #   2. IPv6 estático derivado do IPv4 (opcional)
-#   3. SSH: porta própria, só chave, sem root + firewall UFW (com VOLTA AUTOMÁTICA)
+#   3. SSH: porta própria, só chave, sem root, AllowUsers/forwarding/timeouts + firewall UFW (com VOLTA AUTOMÁTICA)
 #   4. SNMPv3 somente leitura, authPriv (SHA-256/AES), sem community (opcional)
 #
 # Uso (no servidor, como root):
@@ -19,7 +19,7 @@
 # =============================================================================
 set -uo pipefail
 
-VERSAO="2.0.0"
+VERSAO="2.1.0"
 ENV_FILE=/root/baseline.env
 ENV_ANTIGO=/root/g2-baseline.env          # v1 (g2-baseline): lido como padrão, nunca alterado
 TS=$(date +%Y%m%d-%H%M%S)
@@ -41,7 +41,8 @@ ajuda() {
 Arquivo de respostas: o mesmo formato de /root/baseline.env (CHAVE="valor", uma por linha).
 O /root/baseline.env de um servidor serve de modelo para o próximo (troque HOSTNAME_ e V6).
 Chaves: TZ_ HOSTNAME_ ATUALIZAR_AGORA HORA ATUALIZA_SEGURAR V6_ATIVAR V6_BLOCO V6_PREFIXO V6 V6_GW
-        ADMIN_USER PUBKEY SSH_PORT GESTAO_SSH SNMP SNMP_ORIGENS SNMP_USER SNMP_LOCATION SNMP_CONTACT
+        ADMIN_USER PUBKEY SSH_PORT GESTAO_SSH SSH_USUARIOS SSH_TCP_FWD SSH_AGENT_FWD SSH_GRACE SSH_ALIVE_INT SSH_ALIVE_MAX
+        SNMP SNMP_ORIGENS SNMP_USER SNMP_LOCATION SNMP_CONTACT
 EOF
 }
 
@@ -133,6 +134,26 @@ val_tz()       { timedatectl list-timezones 2>/dev/null | grep -qxF -- "$1" && V
 val_hostname() { [[ "${1,,}" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] && VALOR="${1,,}"; }
 val_usuario()  { [[ "$1" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] && id "$1" >/dev/null 2>&1 && VALOR="$1"; }
 val_simnao()   { case "${1,,}" in s|sim|y|yes) VALOR=sim;; n|nao|não|no) VALOR=nao;; *) return 1;; esac; }
+val_faixa()    { # val_faixa VALOR MIN MAX — inteiro decimal dentro da faixa
+  [[ "$1" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= $2 && 10#$1 <= $3 )) && VALOR=$((10#$1)); }
+val_grace()      { val_faixa "$1" 5 600; }
+val_alive_int()  { val_faixa "$1" 0 3600; }
+val_alive_max()  { val_faixa "$1" 1 10; }
+val_usuarios() { # lista de usuários do AllowUsers: nomes simples, existentes, sem root, COM o administrador
+  local u lista="" tem_adm=0
+  local -a arr
+  IFS=' ,' read -ra arr <<<"$1"
+  for u in "${arr[@]}"; do
+    [[ -z "$u" ]] && continue
+    [[ "$u" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { echo "    \"$u\" não é um nome de usuário simples (sem *, ? nem usuario@host)"; return 1; }
+    [[ "$u" == root ]] && { echo "    root não entra por SSH (PermitRootLogin no)"; return 1; }
+    id "$u" >/dev/null 2>&1 || { echo "    o usuário \"$u\" não existe neste servidor"; return 1; }
+    [[ " $lista " == *" $u "* ]] && continue
+    lista+="${lista:+ }$u"
+    [[ "$u" == "${ADMIN_USER:-}" ]] && tem_adm=1
+  done
+  (( tem_adm )) || { echo "    a lista precisa incluir o administrador (${ADMIN_USER:-?}); sem ele você se tranca fora"; return 1; }
+  VALOR="$lista"; }
 val_texto()    { [[ -n "$1" && ${#1} -le 64 && "$1" != *[\"\\\$\`]* ]] && VALOR="$1"; }
 val_pacotes()  { # vazio = nenhum
   local p r=""
@@ -153,7 +174,7 @@ pergunta() {
       [[ -z "$r" ]] && VALOR=""
       printf -v "$var" '%s' "$VALOR"; echo "  $titulo: ${VALOR:-(vazio)}   (arquivo de respostas)"; return 0
     fi
-    pare "$var=\"$r\" do arquivo de respostas é inválido — $titulo"
+    pare "$var=\"$(corta "$r")\" do arquivo de respostas é inválido — $titulo"
   fi
   echo
   echo -e "\e[1m$titulo\e[0m"
@@ -176,7 +197,7 @@ lista_redes() {
   local var=$1 titulo=$2 expl=$3 padrao=$4 r n novo
   local -a lista=()
   if [[ -n "${RESP[$var]+x}" ]]; then
-    val_redes "${RESP[$var]}" || pare "$var=\"${RESP[$var]}\" do arquivo de respostas é inválido — $titulo"
+    val_redes "${RESP[$var]}" || pare "$var=\"$(corta "${RESP[$var]}")\" do arquivo de respostas é inválido — $titulo"
     printf -v "$var" '%s' "$VALOR"; echo "  $titulo: $VALOR   (arquivo de respostas)"; return 0
   fi
   for r in $padrao; do n=$(py_rede rede "$r" 2>/dev/null) && lista+=("$n"); done
@@ -202,6 +223,101 @@ lista_redes() {
   printf -v "$var" '%s' "${lista[*]}"
 }
 
+corta() { local s=$1; (( ${#s} > 40 )) && s="${s:0:40}…"; printf '%s' "$s"; }   # valor vindo de arquivo, curto, para o log
+
+# Mostra as chaves de um authorized_keys SEM o comentário (user@notebook é dado pessoal e iria para o log)
+fps_mostrar() { ssh-keygen -lf "$1" 2>/dev/null | awk '{print $1, $2, $NF}'; }
+
+# Acrescenta uma linha a um arquivo garantindo a quebra de linha antes (senão cola na última chave)
+anexar_linha() { [[ -s "$1" && -n "$(tail -c1 "$1")" ]] && echo >> "$1"; printf '%s\n' "$2" >> "$1"; }
+
+yn() { [[ "$1" == sim ]] && echo yes || echo no; }
+
+# Temporários (senhas do teste SNMP, chave do autoteste) e a chave de autoteste no authorized_keys: sempre limpos na saída
+TMPS=()
+remover_marcador_autoteste() {
+  local t
+  [[ -n "${AK:-}" && -f "$AK" ]] && grep -qF -- "baseline-selftest-$TS" "$AK" || return 0
+  t=$(mktemp) && { grep -vF -- "baseline-selftest-$TS" "$AK" > "$t"; cat "$t" > "$AK"; rm -f "$t"; }
+}
+limpar_temp() { local d; for d in "${TMPS[@]:-}"; do [[ -n "$d" ]] && rm -rf -- "$d"; done; remover_marcador_autoteste; }
+
+# Pares "chave valor" do sshd -T que a configuração escolhida tem de produzir (minúsculas, como o sshd imprime)
+sshd_pares() {
+  printf '%s\n' "port $SSH_PORT" "permitrootlogin no" "passwordauthentication no" "kbdinteractiveauthentication no" \
+    "pubkeyauthentication yes" "maxauthtries 3" "x11forwarding no" \
+    "allowtcpforwarding $(yn "$SSH_TCP_FWD")" "allowagentforwarding $(yn "$SSH_AGENT_FWD")" \
+    "logingracetime $SSH_GRACE" "clientaliveinterval $SSH_ALIVE_INT" "clientalivecountmax $SSH_ALIVE_MAX"
+}
+
+# stdin = saída do sshd -T; imprime o que diverge do escolhido; retorno 1 se divergir (AllowUsers: conjunto exato)
+sshd_diverge() {
+  local saida par falta=0 efet esp
+  saida=$(cat)
+  while IFS= read -r par; do
+    grep -qxF -- "$par" <<<"$saida" || { echo "    esperado '$par' — efetivo: '$(grep -m1 "^${par%% *} " <<<"$saida")'"; falta=1; }
+  done < <(sshd_pares)
+  efet=$(awk '$1=="allowusers"{print $2}' <<<"$saida" | sort | tr '\n' ' ')
+  esp=$(tr ' ' '\n' <<<"$SSH_USUARIOS" | sort | tr '\n' ' ')
+  [[ "$efet" == "$esp" ]] || { echo "    AllowUsers efetivo: ${efet:-(nenhum)}— esperado: $esp"; falta=1; }
+  return "$falta"
+}
+
+# Conteúdo do /etc/ssh/sshd_config.d/10-baseline.conf (stdout)
+gerar_sshd_conf() {
+  echo "# Gerado por baseline v$VERSAO em $(date '+%F %T') — não edite à mão; rode o baseline de novo"
+  echo "Port $SSH_PORT"
+  echo "PermitRootLogin no"
+  echo "PasswordAuthentication no"
+  echo "KbdInteractiveAuthentication no"
+  echo "PubkeyAuthentication yes"
+  echo "MaxAuthTries 3"
+  echo "X11Forwarding no"
+  echo "AllowUsers $SSH_USUARIOS"
+  echo "AllowTcpForwarding $(yn "$SSH_TCP_FWD")"
+  echo "AllowAgentForwarding $(yn "$SSH_AGENT_FWD")"
+  echo "LoginGraceTime $SSH_GRACE"
+  echo "ClientAliveInterval $SSH_ALIVE_INT"
+  echo "ClientAliveCountMax $SSH_ALIVE_MAX"
+}
+
+# Autoteste (depois do restart, antes de pedir o OK). Dois níveis:
+#  1) sshd -T -C (efetivo, com Match) tem de bater com o escolhido;
+#  2) login REAL do ADMIN_USER na porta nova, pelo loopback, com chave efêmera (restrita a 127.0.0.1/::1, só roda /bin/true),
+#     host key fixada (sem confiar na primeira conexão). A chave sai do authorized_keys no trap e logo ao fim.
+# Retorno 0 = passou; 1 = falhou (motivo no stdout).
+autoteste_ssh() {
+  local d efet pub f
+  efet=$(sshd -T -C "user=$ADMIN_USER,host=localhost,addr=127.0.0.1" 2>&1) || { echo "    sshd -T falhou: $efet"; return 1; }
+  efet=$(sshd_diverge <<<"$efet") || { echo "  A configuração efetiva do sshd diverge do escolhido:"; echo "$efet"; return 1; }
+  command -v ssh >/dev/null || { echo "    cliente ssh ausente (apt install openssh-client)"; return 1; }
+  d=$(mktemp -d) || return 1; TMPS+=("$d")
+  ssh-keygen -q -t ed25519 -N '' -C "baseline-selftest-$TS" -f "$d/k" || { echo "    ssh-keygen falhou"; return 1; }
+  pub=$(cat "$d/k.pub")
+  for f in /etc/ssh/ssh_host_*_key.pub; do [[ -r "$f" ]] && printf '[127.0.0.1]:%s %s\n' "$SSH_PORT" "$(cut -d' ' -f1,2 "$f")"; done > "$d/kh"
+  anexar_linha "$AK" "from=\"127.0.0.1,::1\",restrict,command=\"/bin/true\" $pub"
+  if timeout 30 ssh -F /dev/null -p "$SSH_PORT" -i "$d/k" -o BatchMode=yes -o IdentitiesOnly=yes -o PasswordAuthentication=no \
+       -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$d/kh" -o GlobalKnownHostsFile=/dev/null \
+       -o ConnectTimeout=10 -o LogLevel=ERROR "$ADMIN_USER@127.0.0.1" true >/dev/null 2>&1; then
+    remover_marcador_autoteste; rm -rf -- "$d"; return 0
+  fi
+  remover_marcador_autoteste; rm -rf -- "$d"
+  echo "    o login de $ADMIN_USER na porta $SSH_PORT (chave, loopback) foi recusado com as regras novas"
+  echo "    (veja AllowUsers/AllowGroups/Match em /etc/ssh/sshd_config.d e: journalctl -u ssh.service -n 20)"
+  return 1
+}
+
+# Houve login de $ADMIN_USER por chave, de IP que NÃO é loopback, depois do instante $1 (epoch)? O autoteste (loopback) não conta.
+# Ubuntu 24.04: unidade ssh.service; o LogLevel padrão (INFO) registra "Accepted publickey for USER from IP port N".
+login_remoto_visto() {
+  local ip
+  while read -r ip; do
+    case "$ip" in ""|127.*|::1|::ffff:127.*) continue;; *) LOGIN_IP=$ip; return 0;; esac
+  done < <(journalctl -u ssh.service --since "@$1" -o cat --no-pager 2>/dev/null \
+           | awk -v u="$ADMIN_USER" '$1=="Accepted" && $2=="publickey" && $3=="for" && $4==u && $5=="from" {print $6}')
+  return 1
+}
+
 # Descarta o que foi digitado durante etapas longas (ex.: Enter apertado durante o apt), para não virar resposta
 limpar_teclado() { local _l; while read -r -t 0.2 -n 256 _l </dev/tty 2>/dev/null; do :; done; }
 
@@ -224,13 +340,17 @@ salvar_env() {
     echo "# Gerado por baseline v$VERSAO em $(date '+%F %T') — SEM senhas. Serve de padrão para a próxima execução"
     echo "# e de modelo (--respostas) para outro servidor (troque HOSTNAME_ e V6)."
     for k in BASELINE_VERSAO TZ_ HOSTNAME_ ATUALIZAR_AGORA HORA ATUALIZA_SEGURAR IF V4 V4_GW V6_ATIVAR V6_BLOCO V6_PREFIXO V6 V6_GW \
-             ADMIN_USER PUBKEY_FPS SSH_PORT GESTAO_SSH SNMP SNMP_ORIGENS SNMP_USER SNMP_LOCATION SNMP_CONTACT; do
+             ADMIN_USER PUBKEY_FPS SSH_PORT GESTAO_SSH SSH_USUARIOS SSH_TCP_FWD SSH_AGENT_FWD SSH_GRACE SSH_ALIVE_INT SSH_ALIVE_MAX \
+             SNMP SNMP_ORIGENS SNMP_USER SNMP_LOCATION SNMP_CONTACT; do
       case $k in BASELINE_VERSAO) v=$VERSAO;; *) v=${!k:-};; esac
       printf '%s="%s"\n' "$k" "$v"
     done
   } > "$ENV_FILE"
   chmod 600 "$ENV_FILE"
 }
+
+# Permite `source baseline.sh` nos testes (tests/run.sh): só as funções, nada é executado
+[[ "${BASH_SOURCE[0]}" != "$0" ]] && return 0
 
 # ---- Argumentos ---------------------------------------------------------------------------------
 ARQ_RESP=""
@@ -249,6 +369,11 @@ if [[ -n "$ARQ_RESP" ]]; then
   ler_kv "$ARQ_RESP" RESP
 fi
 umask 077
+# Log só do root, desde o primeiro byte (não depender do umask); logs/cópias de execuções antigas também ficam fechados
+install -m 600 -o root -g root /dev/null "$LOG"
+chmod 600 /root/baseline-*.log 2>/dev/null
+for d in /root/baseline-backup-*/; do [[ -d "$d" ]] && chmod 700 "$d"; done
+trap limpar_temp EXIT
 exec > >(tee -a "$LOG") 2>&1
 
 # shellcheck disable=SC1091
@@ -288,6 +413,11 @@ echo " Padrões de: $ORIGEM_PADRAO"
 [[ -n "$CLIENTE_SSH" ]] && echo " Você está conectado por SSH a partir de: $CLIENTE_SSH"
 echo " Enter aceita o valor entre [colchetes]. Nada é alterado antes do resumo final."
 echo "=============================================================="
+for f in /root/baseline-backup-*/PENDENTE; do
+  [[ -e "$f" ]] || continue
+  aviso "Execução de $(basename "$(dirname "$f")" | sed 's/^baseline-backup-//') NUNCA foi confirmada (sem o OK). Se houve reboot antes do OK, a volta automática foi desarmada."
+  echo "        O SSH/UFW atuais são os NOVOS, sem confirmação. Esta execução confirma de novo; para desfazer: sudo bash $(dirname "$f")/volta.sh"
+done
 
 # =================================================================================================
 # PERGUNTAS
@@ -395,7 +525,7 @@ PUBKEY=""
 if [[ -n "${RESP[PUBKEY]+x}" ]]; then
   PUBKEY=${RESP[PUBKEY]}
 elif [[ -n "$FPS_ATUAIS" ]]; then
-  echo; echo "  Chaves já autorizadas para $ADMIN_USER:"; ssh-keygen -lf "$AK" 2>/dev/null | sed 's/^/    /'
+  echo; echo "  Chaves já autorizadas para $ADMIN_USER:"; fps_mostrar "$AK" | sed 's/^/    /'
   read -rp "  Adicionar outra chave pública? (s/N): " r </dev/tty; r=${r:-n}
   [[ "${r,,}" =~ ^s ]] && read -rp "  Cole a chave pública (uma linha, ssh-ed25519 …): " PUBKEY </dev/tty
 else
@@ -424,6 +554,36 @@ if [[ -n "$CLIENTE_SSH" ]] && ! py_rede contem "$CLIENTE_SSH" $GESTAO_SSH; then
   read -rp "  Incluir $CLIENTE_SSH na gestão? (S/n): " r </dev/tty
   [[ "${r,,}" =~ ^n ]] || GESTAO_SSH+=" $(py_rede rede "$CLIENTE_SSH")"
 fi
+
+info "Endurecimento do SSH"
+if [[ -n "${RESP[SSH_USUARIOS]+x}" || -z "$(p SSH_USUARIOS)" ]]; then USU_PADRAO=$ADMIN_USER
+else USU_PADRAO=$(p SSH_USUARIOS); [[ " $USU_PADRAO " == *" $ADMIN_USER "* ]] || USU_PADRAO="$ADMIN_USER $USU_PADRAO"; fi
+pergunta SSH_USUARIOS "Quem pode entrar por SSH (AllowUsers)" \
+"Só estes usuários logam por SSH, mesmo que existam outros com chave. O administrador ($ADMIN_USER) é obrigatório.
+Contas de serviço que usam SSH (backup, rsync…) PERDEM o acesso se não estiverem na lista.
+Aceita vários, separados por espaço ou vírgula; só nomes simples (sem *, ? nem usuario@host)." \
+"$ADMIN_USER backup" "$USU_PADRAO" val_usuarios
+for u in $SSH_USUARIOS; do
+  [[ "$u" == "$ADMIN_USER" ]] && continue
+  hu=$(getent passwd "$u" | cut -d: -f6)
+  [[ -s "$hu/.ssh/authorized_keys" ]] || aviso "$u está liberado, mas não tem $hu/.ssh/authorized_keys — sem chave ele não entra (senha está desligada)."
+done
+pergunta SSH_TCP_FWD "Permitir encaminhamento de portas TCP (AllowTcpForwarding)?" \
+"Não: bloqueia túneis (ssh -L/-R), ssh -J (salto por este servidor como bastion) e o VS Code Remote; sftp/scp continuam.
+Atenção: quem tem shell consegue contornar; isto reduz a superfície, não é barreira forte. Responda s ou n." \
+"n" "$(p SSH_TCP_FWD nao)" val_simnao
+pergunta SSH_AGENT_FWD "Permitir encaminhamento do agente SSH (AllowAgentForwarding)?" \
+"Não: quem entra aqui não consegue usar a SUA chave a partir deste servidor para pular para outro (ssh -A).
+Se o servidor for comprometido, o agente encaminhado seria usado pelo invasor. Responda s ou n." \
+"n" "$(p SSH_AGENT_FWD nao)" val_simnao
+pergunta SSH_GRACE "Tempo para concluir o login (LoginGraceTime, segundos)" \
+"Conexão que não autentica nesse prazo é derrubada (segura vagas contra varredura). Faixa 5–600." \
+"30" "$(p SSH_GRACE 30)" val_grace
+pergunta SSH_ALIVE_INT "Intervalo de verificação da conexão (ClientAliveInterval, segundos)" \
+"A cada N s o servidor testa se o cliente responde. Derruba conexão MORTA (cabo, VPN caída), não sessão parada:
+o cliente responde sozinho. 0 desliga a verificação. Faixa 0–3600." "300" "$(p SSH_ALIVE_INT 300)" val_alive_int
+pergunta SSH_ALIVE_MAX "Falhas seguidas antes de derrubar (ClientAliveCountMax)" \
+"Com 300 s e 2 falhas, uma conexão morta cai em cerca de 10 min. Faixa 1–10." "2" "$(p SSH_ALIVE_MAX 2)" val_alive_max
 
 info "SNMP"
 pergunta SNMP "Configurar SNMPv3 (monitoramento, ex.: PRTG, Zabbix, LibreNMS)?" "Somente leitura, com usuário e duas senhas; sem community v1/v2c." "s" "$(p SNMP sim)" val_simnao
@@ -465,7 +625,10 @@ echo "  Atualizar agora ....: $ATUALIZAR_AGORA"
 echo "  Atualização auto ...: todo dia às $HORA (só segurança, sem reboot automático)"
 echo "  Fora da auto .......: ${ATUALIZA_SEGURAR:-(nenhum)}"
 if [[ -n "$V6" ]]; then echo "  IPv6 ...............: $V6/64  gateway $V6_GW  ($IF)${V6_BLOCO:+  bloco $V6_BLOCO}"; echo "                        teste: $V6_TESTE"; else echo "  IPv6 ...............: não configurar"; fi
-echo "  SSH ................: porta $SSH_PORT, só chave, sem root, usuário $ADMIN_USER"
+echo "  SSH ................: porta $SSH_PORT, só chave, sem root, administrador $ADMIN_USER"
+echo "  SSH AllowUsers .....: $SSH_USUARIOS"
+echo "  SSH encaminhamento .: portas TCP=$SSH_TCP_FWD, agente=$SSH_AGENT_FWD"
+echo "  SSH tempos .........: login ${SSH_GRACE}s; verificação a cada ${SSH_ALIVE_INT}s x ${SSH_ALIVE_MAX}"
 [[ -n "$NOVO_FP" ]] && echo "  Chave nova .........: $NOVO_FP"
 echo "  UFW (entrada) ......: negar tudo, exceto:"
 echo "      SSH $SSH_PORT/tcp de: $GESTAO_SSH"
@@ -476,6 +639,8 @@ if [[ "$SNMP" == sim ]]; then
   echo "                        senhas: $([[ $SNMP_TROCA_SENHA == sim ]] && echo 'novas' || echo 'mantidas')"
 fi
 echo "  Proteção ...........: se o novo acesso SSH não for confirmado em $VOLTA_MIN min, SSH e UFW voltam sozinhos"
+echo "                        (NÃO reinicie o servidor antes do OK: o reboot desarma a volta automática)"
+echo "  Autoteste ..........: login real de $ADMIN_USER pela porta nova (loopback); se falhar, volta na hora"
 echo "  Cópias .............: $BK"
 limpar_teclado
 read -rp "Aplicar? (s/N): " C </dev/tty
@@ -510,7 +675,7 @@ apt-get update -q >/dev/null || pare "apt-get update falhou (internet/DNS do ser
 if [[ "$ATUALIZAR_AGORA" == sim ]]; then
   apt-get "${APT_OPTS[@]}" full-upgrade >/dev/null || pare "full-upgrade falhou"; ok "Sistema atualizado"
 fi
-PKGS=(unattended-upgrades ufw)
+PKGS=(unattended-upgrades ufw openssh-client)
 [[ "$SNMP" == sim ]] && PKGS+=(snmpd snmp)
 apt-get "${APT_OPTS[@]}" install "${PKGS[@]}" >/dev/null || pare "Instalação de pacotes falhou"
 ok "Pacotes: ${PKGS[*]}"
@@ -584,37 +749,37 @@ if [ "$SOCKET_ANTES" = enabled ]; then
 else
   systemctl restart ssh.service
 fi
+rm -f "$BK/PENDENTE"
 EOF
 chmod 700 "$BK/volta.sh"
 VOLTA_UNIT="baseline-volta-$TS"
 systemd-run --quiet --unit="$VOLTA_UNIT" --on-active="${VOLTA_MIN}min" /bin/bash "$BK/volta.sh" \
   || pare "Não consegui armar a volta automática (systemd-run) — nada foi alterado no SSH/UFW"
+# Marcador: se o servidor reiniciar antes do OK o timer (temporário, vive em /run) some e o marcador fica;
+# o baseline-verify e a próxima execução avisam "nunca confirmado".
+cat > "$BK/PENDENTE" <<EOF
+Execução $TS do baseline v$VERSAO armada em $(date '+%F %T') e AINDA NÃO confirmada (sem o OK).
+Se este arquivo continua aí, ou a confirmação não ocorreu ou o servidor reiniciou antes dela (a volta automática some no reboot).
+Confirmar: rode o baseline de novo (ou teste o acesso e rode: sudo baseline-verify).  Desfazer: sudo bash $BK/volta.sh
+EOF
 ok "Volta automática armada: $VOLTA_MIN min ($VOLTA_UNIT)"
 
 install -d -m 700 -o "$ADMIN_USER" -g "$ADMIN_USER" "$H/.ssh"
 if [[ -n "$PUBKEY" ]] && ! grep -qF "$(awk '{print $2}' <<<"$PUBKEY")" "$AK" 2>/dev/null; then
-  printf '%s\n' "$PUBKEY" >> "$AK"; ok "Chave $NOVO_FP adicionada em $AK"
+  anexar_linha "$AK" "$PUBKEY"; ok "Chave $NOVO_FP adicionada em $AK"
 fi
 chown "$ADMIN_USER:$ADMIN_USER" "$AK"; chmod 600 "$AK"
 PUBKEY_FPS=$(ssh-keygen -lf "$AK" 2>/dev/null | awk '{print $2}' | tr '\n' ' '); PUBKEY_FPS=${PUBKEY_FPS% }
 
 [[ -f "$SSHD_ANTIGO" ]] && mv "$SSHD_ANTIGO" "$BK/" && ok "Arquivo da v1 ($SSHD_ANTIGO) substituído (cópia em $BK)"
-cat > "$SSHD_ARQ" <<EOF
-# Gerado por baseline v$VERSAO em $(date '+%F %T') — não edite à mão; rode o baseline de novo
-Port $SSH_PORT
-PermitRootLogin no
-PasswordAuthentication no
-KbdInteractiveAuthentication no
-PubkeyAuthentication yes
-MaxAuthTries 3
-X11Forwarding no
-EOF
+gerar_sshd_conf > "$SSHD_ARQ"
 chmod 644 "$SSHD_ARQ"
 install -d -m 0755 /run/sshd
 if ! sshd -t; then
   bash "$BK/volta.sh"; systemctl stop "$VOLTA_UNIT.timer" 2>/dev/null
   pare "sshd -t reprovou a configuração — SSH e UFW restaurados"
 fi
+T_SSH=$(date +%s)     # logins "Accepted" só contam depois deste instante
 systemctl disable --now ssh.socket >/dev/null 2>&1
 systemctl enable ssh.service >/dev/null 2>&1
 systemctl restart ssh.service || { bash "$BK/volta.sh"; pare "ssh.service não reiniciou — restaurado"; }
@@ -639,23 +804,42 @@ ABERTAS=$(ufw status 2>/dev/null | grep -E 'ALLOW( IN)? +Anywhere' | grep -v '# 
 [[ -n "$ABERTAS" ]] && { aviso "Regras abertas para qualquer origem (não são do baseline; mantidas):"; echo "$ABERTAS" | sed 's/^/      /'; }
 
 echo
+echo "  Autoteste: login real de $ADMIN_USER na porta $SSH_PORT com as regras novas…"
+AT_OUT=$(mktemp); TMPS+=("$AT_OUT")     # saída em arquivo (não em $(...)): os temporários ficam registrados no trap
+if autoteste_ssh > "$AT_OUT"; then
+  ok "Autoteste passou: sshd efetivo confere e $ADMIN_USER entrou (chave, loopback, porta $SSH_PORT)"
+else
+  cat "$AT_OUT"
+  systemctl stop "$VOLTA_UNIT.timer" 2>/dev/null; bash "$BK/volta.sh"
+  pare "Autoteste do SSH falhou — SSH e UFW restaurados. Corrija e rode de novo. (Sistema e IPv6 já aplicados.)"
+fi
+
+echo
 echo -e "\e[1;33m  CONFIRMAÇÃO OBRIGATÓRIA — não feche esta janela.\e[0m"
-echo "  Abra uma conexão SSH NOVA:  $ADMIN_USER@$V4  porta $SSH_PORT  (com a chave)"
+echo "  Abra uma conexão SSH NOVA:  $ADMIN_USER@$V4  porta $SSH_PORT  (com a chave, de um IP da lista de gestão)"
 echo "  Conseguiu entrar? Digite OK. Sem OK em $VOLTA_MIN min, SSH e UFW voltam ao que eram."
-echo "  Não entrou? Digite NAO para voltar agora."
-CONF=""; LIMITE=$(( $(date +%s) + VOLTA_MIN * 60 - 20 ))
+echo "  Não entrou? Digite NAO para voltar agora.   NÃO reinicie o servidor antes do OK (o reboot desarma a volta)."
+[[ "$SSH_TCP_FWD" == nao ]] && echo "  (Encaminhamento de portas desligado: ssh -L/-J por este servidor deixam de funcionar. É o esperado.)"
+CONF=""; SEM_PROVA=0; LOGIN_IP=""; LIMITE=$(( $(date +%s) + VOLTA_MIN * 60 - 20 ))
 limpar_teclado
 while :; do
   RESTA=$(( LIMITE - $(date +%s) )); (( RESTA > 0 )) || { CONF=""; break; }
   read -t "$RESTA" -rp "  [OK/NAO] (${RESTA}s) > " CONF </dev/tty || { CONF=""; break; }
   case "${CONF^^}" in
-    OK) break;;
+    OK)
+      if login_remoto_visto "$T_SSH"; then ok "Visto no journal: login de $ADMIN_USER por chave vindo de $LOGIN_IP"; break; fi
+      if (( SEM_PROVA )); then aviso "Confirmado SEM prova no journal (segundo OK)."; break; fi
+      SEM_PROVA=1
+      aviso "Não vi nenhum login de $ADMIN_USER por chave, de IP fora do loopback, depois do restart do SSH (journalctl -u ssh.service)."
+      echo "    O autoteste local não conta. Entre numa conexão NOVA e digite OK de novo — ou, se tem certeza de que entrou, digite OK outra vez para confirmar assim mesmo."
+      ;;
     NAO|NÃO|N) CONF=NAO; break;;
     *) echo "    Digite OK (entrou pela porta $SSH_PORT) ou NAO (não entrou — volta agora).";;
   esac
 done
 if [[ "${CONF^^}" == OK ]]; then
   systemctl stop "$VOLTA_UNIT.timer" 2>/dev/null; systemctl reset-failed "$VOLTA_UNIT" 2>/dev/null
+  rm -f /root/baseline-backup-*/PENDENTE      # esta confirmação vale também para execuções anteriores não confirmadas
   ok "Acesso confirmado — volta automática desarmada"
 else
   [[ "$CONF" == NAO ]] && echo "  Você respondeu NAO: aplicando a volta AGORA." || echo "  Prazo esgotado sem OK: aplicando a volta AGORA."
@@ -688,7 +872,7 @@ EOF
   systemctl restart snmpd && sleep 2
   if [[ -n "$AUTH" ]]; then
     # Teste real sem senha em argumento: snmp.conf temporário (0600) só para este snmpget
-    T=$(mktemp -d)
+    T=$(mktemp -d); TMPS+=("$T")
     printf 'defVersion 3\ndefSecurityLevel authPriv\ndefSecurityName %s\ndefAuthType SHA-256\ndefAuthPassphrase %s\ndefPrivType AES\ndefPrivPassphrase %s\n' \
       "$SNMP_USER" "$AUTH" "$PRIV" > "$T/snmp.conf"
     if SNMPCONFPATH="$T" snmpget 127.0.0.1 1.3.6.1.2.1.1.3.0 >/dev/null 2>&1; then ok "snmpget SNMPv3 local respondeu"
@@ -707,6 +891,7 @@ fi
 # REGISTRO (sem senhas) e instalação dos comandos
 # =================================================================================================
 salvar_env
+chmod 600 "$LOG" "$ENV_FILE"; chmod 700 "$BK"
 
 AQUI=$(dirname "$(readlink -f "$0")")
 [[ "$(readlink -f "$0")" == /usr/local/sbin/baseline ]] || install -m 700 "$(readlink -f "$0")" /usr/local/sbin/baseline

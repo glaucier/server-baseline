@@ -13,11 +13,11 @@ portas no UFW; o baseline só mexe nas regras marcadas `# baseline:`.
 |---|---|
 | 1. Sistema | fuso horário, nome do servidor, `apt full-upgrade` (opcional), atualização automática diária **só de segurança, sem reboot automático**, no horário escolhido, com lista de pacotes que ela não toca (ex.: `unbound`) |
 | 2. IPv6 | sugere o /64 sozinho (prefixo anunciado pelo roteador, ou o AAAA de um vizinho da mesma rede IPv4 — ex.: o servidor DNS configurado), confere com o bloco do provedor, sugere `<prefixo>::<último octeto>` e **testa antes do resumo**: duplicidade (DAD) e resposta do gateway. Grava `/etc/netplan/60-ipv6.yaml` e já ativa, sem reboot |
-| 3. SSH + UFW | porta própria, só chave, sem root; UFW nega a entrada e libera o SSH só para as redes de gestão. **Volta automática**: se o novo acesso não for confirmado em 5 minutos, SSH e UFW voltam ao que eram |
+| 3. SSH + UFW | porta própria, só chave, sem root; **AllowUsers** (padrão: só o administrador), **AllowTcpForwarding no**, **AllowAgentForwarding no**, `LoginGraceTime 30`, `ClientAliveInterval 300`, `ClientAliveCountMax 2` (cada um é perguntado); UFW nega a entrada e libera o SSH só para as redes de gestão. **Volta automática**: se o novo acesso não for confirmado em 5 minutos, SSH e UFW voltam ao que eram |
 | 4. SNMPv3 | somente leitura, `authPriv` (SHA-256/AES), sem community; porta 161 só para o monitoramento |
 
 As respostas (sem senha) ficam em `/root/baseline.env` e viram o padrão da próxima execução.
-Cópias do que foi alterado: `/root/baseline-backup-<data>/`. Log: `/root/baseline-<data>.log`.
+Cópias do que foi alterado: `/root/baseline-backup-<data>/`. Log: `/root/baseline-<data>.log` (veja "Segurança").
 
 ## Antes de rodar
 
@@ -32,21 +32,58 @@ No servidor, baixe uma **versão marcada** (nunca a `main`), confira o SHA256 pu
 
 ```bash
 cd /tmp
-curl -fsSLO https://raw.githubusercontent.com/glaucier/server-baseline/v2.0.0/baseline.sh
-curl -fsSLO https://raw.githubusercontent.com/glaucier/server-baseline/v2.0.0/baseline-verify.sh
-sha256sum baseline.sh baseline-verify.sh      # compare com a página da versão (Releases)
+curl -fsSLO https://raw.githubusercontent.com/glaucier/server-baseline/v2.1.0/baseline.sh
+curl -fsSLO https://raw.githubusercontent.com/glaucier/server-baseline/v2.1.0/baseline-verify.sh
+curl -fsSLO https://raw.githubusercontent.com/glaucier/server-baseline/v2.1.0/SHA256SUMS
+sha256sum -c SHA256SUMS                       # os dois têm de dar "OK"; compare também com a página da versão (Releases)
 sudo bash baseline.sh
 ```
 
 Sem internet no servidor: copie os dois arquivos para `/tmp` por `scp` e rode igual.
 
 Ao final, **sem fechar a sessão**, abra uma conexão SSH nova na porta nova e digite `OK` no script.
+Antes de pedir o OK, o script faz um **autoteste**: confere o `sshd -T` efetivo e faz um login real do administrador
+na porta nova (chave efêmera, só pelo loopback, removida em seguida). Se falhar, SSH e UFW voltam na hora.
+O `OK` só é aceito direto se o journal (`journalctl -u ssh.service`) mostrar um login do administrador por chave
+vindo de um IP que **não** seja o loopback; sem isso o script avisa e exige um **segundo `OK`** (o autoteste local não conta).
+
+### ⚠ Não reinicie o servidor antes do OK
+
+A volta automática é um timer **temporário** do systemd (`systemd-run`, vive em `/run`): um **reboot antes do OK a desarma**
+(nada mais desfaz sozinho). O SSH/UFW novos continuam valendo. O baseline deixa `/root/baseline-backup-<data>/PENDENTE`
+até a confirmação; o `baseline-verify` e a próxima execução avisam "baseline nunca confirmado".
+
+Se isso acontecer:
+
+1. **O acesso novo funciona** (porta nova, chave, IP de gestão)? Rode `sudo baseline-verify` e depois `sudo bash baseline.sh`
+   outra vez, confirmando com `OK` — isso limpa o aviso.
+2. **Não entra?** Use o **console da VM** e desfaça: `sudo bash /root/baseline-backup-<data>/volta.sh`
+   (restaura SSH e UFW de antes; o script fica no disco, sobrevive ao reboot).
+3. Para saber se há volta armada neste momento: `systemctl list-timers 'baseline-volta-*'`.
+
 Depois:
 
 ```bash
 sudo reboot
 sudo baseline-verify          # só leitura; saída 0 = tudo OK
 ```
+
+## Endurecimento do SSH (perguntas)
+
+Cada item tem explicação, exemplo e padrão seguro; a resposta anterior vira o padrão da próxima execução.
+
+| Pergunta | Chave no `.env` | Padrão | Atenção |
+|---|---|---|---|
+| AllowUsers | `SSH_USUARIOS` | só o administrador | aceita vários (espaço ou vírgula); o administrador é obrigatório; contas de serviço (backup, rsync) perdem o SSH se não estiverem na lista |
+| AllowTcpForwarding | `SSH_TCP_FWD` | `nao` | quebra `ssh -L/-R`, `ssh -J` (bastion) e VS Code Remote; não é barreira forte contra quem tem shell |
+| AllowAgentForwarding | `SSH_AGENT_FWD` | `nao` | `ssh -A` deixa de funcionar a partir deste servidor |
+| LoginGraceTime | `SSH_GRACE` | `30` | 5–600 s |
+| ClientAliveInterval | `SSH_ALIVE_INT` | `300` | 0–3600 s; derruba conexão **morta**, não sessão parada |
+| ClientAliveCountMax | `SSH_ALIVE_MAX` | `2` | 1–10 |
+
+O `baseline-verify` confere esses itens pelo `sshd -T -C user=<admin>,…` (efetivo, com os blocos `Match`). O AllowUsers
+é comparado como **conjunto exato**: um `AllowUsers` a mais em outro arquivo de `sshd_config.d` (a diretiva acumula) dá FALHA.
+Servidores que rodaram a v2.0.0 ainda não têm essas chaves no `.env`: o verify mostra AVISO até você rodar o baseline de novo.
 
 ## Listas de IPs/redes
 
@@ -78,3 +115,28 @@ substitui o `10-g2-hardening.conf` pelo `10-baseline.conf` (o antigo fica na pas
   (nunca a senha em argumento, que apareceria no `ps`).
 - Validação de IP/rede pelo `ipaddress` do Python; `0.0.0.0/0` não é aceito como rede de gestão.
 - Se você estiver conectado de um IP fora da lista de gestão, o script avisa e oferece incluí-lo.
+- **Log (`/root/baseline-<data>.log`)**: criado `600` (root) antes de gravar o primeiro byte, e o `baseline-verify` confere
+  `600` no log e no `baseline.env` e `700` na pasta de cópias. **Não contém senhas** (nem as do SNMP, nem
+  o que você digita: o terminal faz o eco, não o log). **Contém topologia**: IPs do servidor, do gateway, das redes de
+  gestão e do monitoramento, porta do SSH, usuários (administrador, SNMP, AllowUsers), hostname, location/contact do SNMP e
+  as impressões digitais das chaves (o comentário `usuario@notebook` da chave **não** é gravado). Trate o log como reservado:
+  não o anexe a chamados nem o envie sem revisar. Valores inválidos vindos de `--respostas` aparecem truncados em 40 caracteres.
+- A chave efêmera do autoteste e o `snmp.conf` temporário (com as senhas, só durante o teste) ficam em pastas `0700` e são
+  apagados na saída do script, mesmo se ele for interrompido (`trap`); o `baseline-verify` acusa uma chave
+  `baseline-selftest-*` esquecida no `authorized_keys`.
+
+## Testes
+
+```bash
+bash tests/run.sh       # unitários + política + sshd real (a parte do sshd roda com sudo; no CI é obrigatória)
+shellcheck -S warning *.sh tests/*.sh
+```
+
+A parte de integração sobe um `sshd` de verdade numa porta alta e prova: o `10-baseline.conf` passa no `sshd -t`, o efetivo
+bate, o autoteste passa e falha quando deve, `AllowTcpForwarding no` nega `ssh -R`, e o `Accepted publickey` do loopback não
+vale como prova do OK. O CI (`.github/workflows/verificar.yml`) roda tudo a cada PR.
+
+## Versões
+
+Cada versão é uma tag (`vX.Y.Z`) com `SHA256SUMS` e o texto da release em `docs/`. Mudou um script? Regenere
+`sha256sum baseline.sh baseline-verify.sh > SHA256SUMS` (o teste reprova se estiver desatualizado).
