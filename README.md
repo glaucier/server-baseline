@@ -96,6 +96,7 @@ ordem de leitura e compara com o que você escolheu:
 |---|---|
 | **Conforto** (`ClientAliveInterval`, `ClientAliveCountMax`, `LoginGraceTime`) vencido por outro arquivo | **avisa no resumo** e segue: `SSH ClientAliveInterval: escolhido 300, mas 01-dns-admin.conf define 3 e VENCE (o sshd usa a 1.ª ocorrência)`. O autoteste passa a esperar o valor que **vence**, então outro produto vencendo não aborta |
 | **Segurança** (`Port`, `PasswordAuthentication`, `KbdInteractiveAuthentication`, `PermitRootLogin`, `PubkeyAuthentication`, `AllowUsers`, `MaxAuthTries`, `X11Forwarding`, `AllowTcpForwarding`, `AllowAgentForwarding`) com valor **menos seguro** (inclusive `Port` ou `AllowUsers` **somados** por outro arquivo, que acumulam) | **para antes de aplicar**, nomeando o arquivo. Nada é alterado |
+| `Port` repetida em outro arquivo com o **mesmo valor** (ex.: `01-dns-admin.conf` com `Port 44320` e o baseline escolhendo 44320) | **não é conflito**: o baseline compara o **conjunto** de portas efetivo, sem repetição. Só para se houver porta **a mais** (ex.: `Port 2222`) ou faltar a escolhida |
 | Segurança com valor **mais restritivo** (ex.: `MaxAuthTries 2`) | avisa e segue |
 | `sshd_config` sem o `Include` de `sshd_config.d` | para: o `10-baseline.conf` seria ignorado |
 | Diferença **inesperada** depois de aplicar | o autoteste continua abortando e restaurando SSH/UFW |
@@ -113,6 +114,26 @@ Tudo aparece no **RESUMO** antes de "Aplicar?" e é conferido pelo `baseline-ver
 | Relógio sincronizado | (não é pergunta) | — | confere `timedatectl show -p NTPSynchronized` e o serviço de hora ativo (systemd-timesyncd **ou** chrony). Não sincronizado: espera até 60 s; persistindo, AVISO no resumo ("DNSSEC e certificados dependem da hora certa"). **Nunca troca** timesyncd por chrony. `baseline-verify`: **FALHA** se não sincronizado ou sem serviço de hora |
 | Atalhos de terminal (alias) para TODOS os usuários, inclusive root | `ATALHOS` | `r=reset` | `nome=comando`, vários separados por espaço (o comando pode ter espaços: `r=reset ll=ls -la`); nome `[a-z][a-z0-9_-]*`; proibidos no comando `; \| & \` $ ( ) < >`, barra invertida e aspas; `nenhum` remove tudo. Grava **um bloco** entre `# baseline: atalhos (início)` e `# baseline: atalhos (fim)` em `/etc/bash.bashrc`, **reescrito por inteiro** a cada execução (rodar 2× não duplica). Nunca edita `~/.bashrc` de usuário. Só vale em shells interativos do bash. `baseline-verify`: o bloco bate com o `.env` e `bash -ic 'alias r'` responde como root e como o administrador |
 | Anexar ao Ubuntu Pro (Livepatch, ESM)? | `PRO_ANEXAR` | `nao` | token de https://ubuntu.com/pro digitado **sem eco**, passado ao `pro attach --attach-config` por **arquivo temporário 0600** (pasta 0700, apagado no fim e no `trap`); **nunca** em argumento, log, resumo nem `baseline.env` (o resumo só diz "anexar: sim"). Já anexado: pula. `baseline-verify`: informa o estado (`pro status --format json`) e dá AVISO só se o `.env` pediu e não está anexado |
+
+## Se o baseline parar ("Abortado")
+
+O `baseline-verify` só é instalado em `/usr/local/sbin` no **fim** (etapa 4/4). Se a execução para antes (conflito de SSH, autoteste…), o
+`sudo baseline-verify` instalado ainda é o da **versão anterior**. Por isso toda mensagem "Abortado" termina com
+`Para conferir com a versão nova: sudo bash <pasta do script>/baseline-verify.sh`. O verify também imprime a **sua própria versão**
+no cabeçalho (`baseline-verify v2.2.0`) separada da versão que aplicou o padrão (`padrão aplicado pela v…`).
+
+## SNMP: snmpd.conf de outro produto e teste real
+
+- **`snmpd.conf` de outro produto** (ex.: o DNS Admin instala o seu, com `agentAddress udp:161,udp6:161`): se o arquivo existe, tem conteúdo,
+  não começa com `# Gerado por baseline v` e não é o arquivo original do pacote (md5 do dpkg), o baseline **não o sobrescreve** (como no SSH): o resumo avisa
+  "snmpd.conf de outro produto — mantido; só o usuário SNMPv3 é conferido" e não pede senhas. A decisão é tomada **antes** de instalar pacotes
+  (o apt cria um `snmpd.conf` de fábrica, que não conta como de outro produto).
+- **`baseline-verify`**: escutar em `0.0.0.0:161`/`[::]:161` **cobre** os endereços esperados (OK, "escuta em todos os endereços — inclui X"). Num `snmpd.conf` de outro
+  produto, endereço de escuta, `sysLocation` e `sysContact` são **AVISO informativo**; `rouser`, "sem community" e o usuário SNMPv3 continuam FALHA.
+- **Teste real do SNMPv3** (opcional, interativo): cada senha em linha própria, sem eco, com `(digitado: N caracteres)` (nunca o conteúdo). Testa em **127.0.0.1 e no IP**
+  da interface; se só o local responde, diz "responde local, não no IP — confira o agentAddress e o UFW". Na falha mostra o **motivo** sem senhas:
+  `Timeout` (rede/UFW/endereço de escuta), `Authentication failure`/`wrong digest` (senha de autenticação), `Decryption error` (senha de criptografia), `Unknown user name` (usuário).
+  As senhas vão ao `snmpget` só por um `snmp.conf` 0600 (pasta 0700, apagada no `trap`) apontado por `SNMPCONFPATH`, nunca no argv (`ps`).
 
 ## Listas de IPs/redes
 

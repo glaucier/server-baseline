@@ -20,6 +20,12 @@ Achados da simulação "como cliente" do DNS Admin (VM Ubuntu 24.04 limpa).
   Agora o baseline detecta isso **antes do resumo** (simulação com `sshd -T -f`): conforto vencido → aviso no resumo e o autoteste espera o valor que vence; segurança com valor menos seguro (Port, PasswordAuthentication, PermitRootLogin, PubkeyAuthentication, AllowUsers…) → **para antes de aplicar**, citando o arquivo; diferença inesperada continua abortando. Nunca edita nem move arquivo de outro produto.
   `baseline-verify`: mesma regra (conforto = AVISO "outro arquivo vence", segurança = FALHA citando o arquivo).
 
+### Corrigido (2.º teste real na VM, 06/11 14:38–14:43)
+- **Falso conflito de porta:** `Port 44320` repetida em outro arquivo com o mesmo valor do baseline fazia o resumo parar ("escutaria em: 44320 44320 … Port ACUMULA"). Agora compara o **conjunto** de portas efetivo (sem repetição): só é conflito com porta **a mais** ou se faltar a escolhida (`baseline.sh` e `baseline-verify`).
+- **Verify antigo depois de abortar:** toda mensagem "Abortado" diz `Para conferir com a versão nova: sudo bash <pasta do script>/baseline-verify.sh`; o `baseline-verify` imprime a **própria versão** no cabeçalho (além da versão que aplicou o padrão).
+- **SNMP com arquivo de outro produto:** o baseline **não sobrescreve** um `snmpd.conf` que não seja seu nem o de fábrica do pacote (aviso no resumo "mantido; só o usuário SNMPv3 é conferido", sem pedir senhas). No `baseline-verify`, escutar em `0.0.0.0:161`/`[::]:161` cobre os endereços esperados, e para `snmpd.conf` de outro produto endereço/localização/contato viram AVISO informativo (`rouser`, "sem community" e o usuário SNMPv3 continuam FALHA).
+- **Teste real do SNMP no verify:** cada senha em linha própria com `(digitado: N caracteres)`; testa em `127.0.0.1` **e** no IP ("responde local, não no IP — confira o agentAddress e o UFW"); mostra o **motivo** da falha sem senhas (`Timeout`, `Authentication failure`/`wrong digest`, `Decryption error`, `Unknown user name`); senhas só em `snmp.conf` 0600 apagado no `trap`, nunca no argv.
+
 ### Contrato do baseline.env
 - Nenhuma chave existente foi renomeada, removida nem mudou de formato.
 - Chaves **novas** (não fazem parte do contrato; são estado interno): `DISCO_EXPANDIR`, `ATALHOS`, `PRO_ANEXAR`.

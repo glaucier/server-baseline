@@ -6,6 +6,7 @@
 # Lê /root/baseline.env (respostas da última execução, sem senha) — sem executá-lo.
 # =============================================================================
 set -uo pipefail
+VERIFY_VERSAO="2.2.0"      # a versão DESTE verify (BASELINE_VERSAO, no .env, é a de quem aplicou o padrão)
 PASS=0; FAIL=0; AVISO=0
 
 ENV_FILE=/root/baseline.env
@@ -200,11 +201,11 @@ ssh_confere_valor() { # $1 diretiva (minúscula)  $2 escolhido  $3 saída do ssh
     avs "sshd efetivo: $k — outro arquivo vence: $quem define $real (o baseline escolheu $want)" false
   fi
 }
-ssh_confere_portas() { # $1 porta escolhida  $2 saída do sshd -T
-  local efet
-  efet=$(awk '$1=="port"{print $2}' <<<"$2" | sort -n | tr '\n' ' '); efet=${efet% }
-  if [[ "$efet" == "$1" ]]; then chk "sshd efetivo: port $1" true
-  else chk "sshd efetivo: port esperado $1, efetivo ${efet:-nenhuma} ($(ssh_quem_todos port) acrescenta; Port acumula entre arquivos)" false; fi
+ssh_confere_portas() { # $1 porta escolhida  $2 saída do sshd -T  (conjunto SEM repetição: Port repetida com o mesmo valor é a mesma porta)
+  local efet dif
+  efet=$(awk '$1=="port"{print $2}' <<<"$2" | sort -nu | tr '\n' ' '); efet=${efet% }
+  if dif=$(ssh_portas_dif "$1" "$efet"); then chk "sshd efetivo: port $1" true
+  else chk "sshd efetivo: port esperado $1, efetivo ${efet:-nenhuma} ($dif; $(ssh_quem_todos port) define Port; Port acumula entre arquivos)" false; fi
 }
 
 # SSH efetivo (saída do `sshd -T -C user=…`, que respeita Match) contra o que o baseline registrou.
@@ -311,12 +312,127 @@ d = json.load(sys.stdin)
 print("sim " + " ".join(s["name"] for s in d.get("services", []) if s.get("status") == "enabled") if d.get("attached") else "nao")' <<<"$j" 2>/dev/null || echo nao
 }
 
+# --- CÓPIA EXATA de baseline.sh (tests/run.sh confere que é idêntica) ---
+SNMPD_ARQ=/etc/snmp/snmpd.conf
+# Portas: compara o CONJUNTO (sem repetição). "Port 44320" repetido em outro arquivo não muda nada (o sshd escuta uma vez).
+# ssh_portas_dif ESCOLHIDA "EFETIVAS" -> retorno 1 e a explicação se houver porta A MAIS ou faltar a escolhida
+ssh_portas_dif() {
+  local esc=$1 ef p mais="" falta=""
+  ef=$(tr ' ' '\n' <<<"$2" | sed '/^$/d' | sort -nu | tr '\n' ' '); ef=${ef% }
+  for p in $ef; do [[ "$p" == "$esc" ]] || mais+="${mais:+ }$p"; done
+  [[ " $ef " == *" $esc "* ]] || falta=$esc
+  [[ -z "$mais$falta" ]] && return 0
+  echo "${mais:+porta a mais: $mais}${mais:+${falta:+; }}${falta:+falta a escolhida: $falta}"
+  return 1
+}
+# 0 = o snmpd.conf existe, tem conteúdo, NÃO foi gerado pelo baseline e NÃO é o arquivo original do pacote snmpd (md5 do dpkg)
+snmpd_de_outro() {
+  local md5 pk
+  [[ -s "$SNMPD_ARQ" ]] || return 1
+  head -1 "$SNMPD_ARQ" | grep -q '^# Gerado por baseline v' && return 1
+  pk=$(dpkg-query -W -f='${Conffiles}\n' snmpd 2>/dev/null | awk -v f="$SNMPD_ARQ" '$1==f{print $2}')
+  md5=$(md5sum "$SNMPD_ARQ" 2>/dev/null | awk '{print $1}')
+  [[ -n "$pk" && "$pk" == "$md5" ]] && return 1
+  return 0
+}
+
+# --- Cabeçalho: a versão DESTE verify e a de quem aplicou o padrão ---
+verify_cabecalho() {
+  echo "=============================================================="
+  echo " baseline-verify v$VERIFY_VERSAO — $(hostname) — $(date '+%F %T')"
+  echo " uptime: $(uptime -p)   padrão aplicado pela v$(e BASELINE_VERSAO)"
+  echo "=============================================================="
+}
+
+# --- SNMP ---
+# Escuta em ENDEREÇO:161? $1 = saída de `ss -ulnH`, $2 = endereço. Imprime: exato | todos (0.0.0.0, [::] ou *: cobrem o endereço) | (nada)
+snmp_cobre() {
+  if awk -v a="$2:161" '$4 == a { f = 1 } END { exit !f }' <<<"$1"; then echo exato
+  elif awk '$4 == "0.0.0.0:161" || $4 == "[::]:161" || $4 == "*:161" { f = 1 } END { exit !f }' <<<"$1"; then echo todos; fi
+}
+# Escuta, rouser e community (e, se o snmpd.conf é de OUTRO produto, endereço/localização/contato só como AVISO informativo)
+conf_tem_linha() { grep -E "^[[:space:]]*$1[[:space:]]" "$SNMPD_ARQ" 2>/dev/null | grep -qF -- "$2"; }
+confere_snmp_conf() { # $1 = saída de `ss -ulnH`  $2 = IPv4 deste servidor  $3 = usuário SNMPv3
+  local ss=$1 v4=$2 su=$3 outro=nao ad modo
+  snmpd_de_outro && outro=sim
+  [[ $outro == sim ]] && inf "snmpd.conf é de outro produto (não começa com \"# Gerado por baseline v\"): endereço de escuta, localização e contato são só informativos; rouser, community e o usuário SNMPv3 continuam valendo"
+  for ad in "$v4" 127.0.0.1; do
+    [[ -n "$ad" ]] || continue
+    modo=$(snmp_cobre "$ss" "$ad")
+    case $modo in
+      exato) chk "snmpd escutando em $ad:161" true;;
+      todos) chk "snmpd escuta em todos os endereços (0.0.0.0/[::]:161) — inclui $ad:161" true;;
+      *) if [[ $outro == sim ]]; then avs "snmpd não escuta em $ad:161 (snmpd.conf de outro produto: informativo)" false
+         else chk "snmpd escutando em $ad:161" false; fi;;
+    esac
+  done
+  chk "rouser $su priv"                               grep -qx "rouser $su priv" "$SNMPD_ARQ"
+  chk "Sem community (v1/v2c)"                        bash -c "! grep -qiE '^\s*(rocommunity|rwcommunity|com2sec)' '$SNMPD_ARQ'"
+  if [[ $outro == sim ]]; then
+    [[ -n "$(e SNMP_LOCATION)" ]] && avs "sysLocation $(e SNMP_LOCATION) no snmpd.conf (informativo)" conf_tem_linha sysLocation "$(e SNMP_LOCATION)"
+    [[ -n "$(e SNMP_CONTACT)" ]]  && avs "sysContact $(e SNMP_CONTACT) no snmpd.conf (informativo)"  conf_tem_linha sysContact  "$(e SNMP_CONTACT)"
+  fi
+  return 0
+}
+
+# --- Teste real do SNMPv3 ---
+TMPV=()
+limpa_v() { local d; for d in "${TMPV[@]:-}"; do [[ -n "$d" ]] && rm -rf -- "$d"; done; }
+# Leitura oculta: rótulo e quebra de linha na MESMA saída (stderr), e só QUANTOS caracteres foram digitados, nunca o conteúdo
+ler_oculto() { # $1 = rótulo  $2 = nome da variável
+  local _v
+  printf '  %s' "$1" >&2
+  read -rs _v
+  printf '\n  (digitado: %d caracteres)\n' "${#_v}" >&2
+  printf -v "$2" '%s' "$_v"
+}
+# Motivo legível do snmpget SEM senhas. $1 = stderr, $2/$3 = senhas (mascaradas se aparecerem)
+snmp_motivo() {
+  local e=$1 l
+  case $e in
+    *"Unknown user name"*)                                    echo "Unknown user name (usuário SNMPv3 errado ou inexistente)";;
+    *"Decryption error"*)                                     echo "Decryption error (senha de CRIPTOGRAFIA)";;
+    *"Authentication failure"*|*"wrong digest"*)              echo "Authentication failure / wrong digest (senha de AUTENTICAÇÃO)";;
+    *Timeout*|*"No Response"*)                                echo "Timeout (rede, UFW ou endereço de escuta do snmpd)";;
+    *) l=$(head -1 <<<"$e"); l=${l//"$2"/***}; l=${l//"$3"/***}; l=${l//\\/}; l=${l//[^[:print:]]/ }
+       echo "motivo não reconhecido: ${l:-sem mensagem do snmpget}";;
+  esac
+}
+# snmpget SNMPv3 em $1. Senhas SÓ em snmp.conf 0600 (pasta 0700, apagada no trap) apontado por SNMPCONFPATH — nunca no argv (ps).
+# Retorno 0 = respondeu; senão 1 e SNMP_MOTIVO. $2 = usuário  $3 = senha de autenticação  $4 = senha de criptografia
+SNMP_MOTIVO=""
+snmp_get() {
+  local d err
+  SNMP_MOTIVO=""
+  d=$(mktemp -d) || { SNMP_MOTIVO="sem espaço para o arquivo temporário"; return 1; }
+  TMPV+=("$d"); chmod 700 "$d"
+  ( umask 077; printf 'defVersion 3\ndefSecurityLevel authPriv\ndefSecurityName %s\ndefAuthType SHA-256\ndefAuthPassphrase %s\ndefPrivType AES\ndefPrivPassphrase %s\n' "$2" "$3" "$4" > "$d/snmp.conf" )
+  chmod 600 "$d/snmp.conf"
+  if err=$(SNMPCONFPATH="$d" snmpget -t 3 -r 1 "$1" 1.3.6.1.2.1.1.3.0 2>&1 >/dev/null); then rm -rf -- "$d"; return 0; fi
+  rm -rf -- "$d"
+  SNMP_MOTIVO=$(snmp_motivo "$err" "$3" "$4")
+  return 1
+}
+# Testa em 127.0.0.1 E no IPv4 da interface; se só o local responde, diz que é o endereço de escuta/UFW
+snmp_confere_real() { # $1 usuário  $2 senha de autenticação  $3 senha de criptografia  $4 IPv4
+  local su=$1 a=$2 p=$3 v4=$4 okl=0 oki=0 ml="" mi=""
+  snmp_get 127.0.0.1 "$su" "$a" "$p" && okl=1; ml=$SNMP_MOTIVO
+  if [[ -n "$v4" ]]; then snmp_get "$v4" "$su" "$a" "$p" && oki=1; mi=$SNMP_MOTIVO; fi
+  if (( okl )); then chk "snmpget SNMPv3 em 127.0.0.1 respondeu" true
+  else chk "snmpget SNMPv3 em 127.0.0.1: $ml$( (( oki )) && echo ' (responde no IP, não no local)')" false; fi
+  [[ -n "$v4" ]] || return 0
+  if (( oki )); then chk "snmpget SNMPv3 em $v4 respondeu" true
+  elif (( okl )); then chk "snmpget SNMPv3 em $v4: responde local, não no IP — confira o agentAddress e o UFW (motivo: $mi)" false
+  else chk "snmpget SNMPv3 em $v4: $mi" false; fi
+}
+
 # Permissão: dono root e nenhum bit de grupo/outros. $1 = arquivo ou pasta
 so_root() { local m o; m=$(stat -c '%a' "$1" 2>/dev/null) || return 1; o=$(stat -c '%U' "$1"); [[ "$o" == root ]] && (( (8#$m & 8#077) == 0 )); }
 
 # Guard: `source baseline-verify.sh` nos testes (tests/run.sh) só traz as funções
 [[ "${BASH_SOURCE[0]}" != "$0" ]] && return 0
 
+trap limpa_v EXIT
 [[ $EUID -eq 0 ]] || { echo "Rode como root: sudo baseline-verify"; exit 1; }
 [[ -r "$ENV_FILE" ]] || { echo "Não achei $ENV_FILE — rode o baseline antes."; exit 1; }
 while IFS= read -r linha || [[ -n "$linha" ]]; do
@@ -331,10 +447,7 @@ IF=$(e IF); V4=$(e V4); V6=$(e V6); V6_GW=$(e V6_GW)
 SSH_PORT=$(e SSH_PORT); ADMIN_USER=$(e ADMIN_USER); HORA=$(e HORA)
 GW4=$(ip -4 route show default 2>/dev/null | awk '/default/{print $3; exit}')
 
-echo "=============================================================="
-echo " baseline-verify — $(hostname) — $(date '+%F %T')"
-echo " uptime: $(uptime -p)   padrão aplicado pela v$(e BASELINE_VERSAO)"
-echo "=============================================================="
+verify_cabecalho
 
 sec "Sistema"
 chk "Fuso horário $(e TZ_)"                          igual "$(timedatectl show -p Timezone --value)" "$(e TZ_)"
@@ -459,19 +572,15 @@ if [[ "$(e SNMP)" == sim ]]; then
   sec "SNMPv3"
   SU=$(e SNMP_USER)
   chk "snmpd ativo e habilitado"                      bash -c "systemctl is-active --quiet snmpd && systemctl is-enabled --quiet snmpd"
-  chk "snmpd escutando em $V4:161"                    bash -c "ss -ulnH | grep -q '$V4:161'"
-  chk "snmpd escutando em 127.0.0.1:161"              bash -c "ss -ulnH | grep -q '127.0.0.1:161'"
-  chk "rouser $SU priv"                               grep -qx "rouser $SU priv" /etc/snmp/snmpd.conf
-  chk "Sem community (v1/v2c)"                        bash -c "! grep -qiE '^\s*(rocommunity|rwcommunity|com2sec)' /etc/snmp/snmpd.conf"
+  confere_snmp_conf "$(ss -ulnH)" "$V4" "$SU"
   chk "Usuário criado (usmUser ≥ 1, createUser = 0)"  bash -c "(( \$(grep -c '^usmUser' /var/lib/snmp/snmpd.conf) >= 1 )) && (( \$(grep -c '^createUser' /var/lib/snmp/snmpd.conf) == 0 ))"
   if [[ -t 0 ]]; then
-    read -rsp "  Teste real SNMPv3? Senha de AUTENTICAÇÃO (Enter pula): " A; echo
+    echo; echo "  Teste real SNMPv3 (opcional). As senhas não aparecem na tela: só quantos caracteres foram digitados."
+    ler_oculto "Senha de AUTENTICAÇÃO (Enter pula): " A
     if [[ -n "$A" ]]; then
-      read -rsp "  Senha de CRIPTOGRAFIA: " P; echo
-      T=$(mktemp -d)        # senhas por arquivo 0600 temporário, nunca em argumento (apareceriam no ps)
-      printf 'defVersion 3\ndefSecurityLevel authPriv\ndefSecurityName %s\ndefAuthType SHA-256\ndefAuthPassphrase %s\ndefPrivType AES\ndefPrivPassphrase %s\n' "$SU" "$A" "$P" > "$T/snmp.conf"
-      chk "snmpget SNMPv3 em $V4 respondeu"           env SNMPCONFPATH="$T" snmpget "$V4" 1.3.6.1.2.1.1.3.0
-      rm -rf "$T"; unset A P
+      ler_oculto "Senha de CRIPTOGRAFIA: " P
+      snmp_confere_real "$SU" "$A" "$P" "$V4"
+      unset A P
     fi
   fi
 fi

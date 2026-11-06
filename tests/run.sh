@@ -73,7 +73,7 @@ t "valores válidos entram nas variáveis" no_baseline 'ADMIN_USER=daemon; decla
   pergunta SSH_ALIVE_INT T "" "" "" val_alive_int >/dev/null; pergunta SSH_ALIVE_MAX T "" "" "" val_alive_max >/dev/null
   [[ $SSH_USUARIOS == "daemon nobody" && $SSH_GRACE == 45 && $SSH_TCP_FWD == sim && $SSH_ALIVE_INT == 0 && $SSH_ALIVE_MAX == 3 ]]'
 t "AllowUsers sem o admin no arquivo → aborta (nada é alterado)" no_baseline 'ADMIN_USER=daemon; declare -A RESP=([SSH_USUARIOS]="nobody"); ( pergunta SSH_USUARIOS T "" "" "" val_usuarios ) >/dev/null 2>&1; [[ $? -ne 0 ]]'
-t "valor inválido no arquivo aborta e o log recebe só 40 caracteres dele" no_baseline 'LOG=/dev/null; v=$(printf "9%.0s" {1..300}); declare -A RESP=([SSH_GRACE]="$v"); saida=$( ( pergunta SSH_GRACE T "" "" "" val_grace ) 2>&1 ); rc=$?; [[ $rc -ne 0 && ${#saida} -lt 200 ]]'
+t "valor inválido no arquivo aborta e o log recebe só 40 caracteres dele" no_baseline 'LOG=/dev/null; v=$(printf "9%.0s" {1..300}); declare -A RESP=([SSH_GRACE]="$v"); saida=$( ( pergunta SSH_GRACE T "" "" "" val_grace ) 2>&1 ); rc=$?; [[ $rc -ne 0 && "$saida" != *"$(printf "9%.0s" {1..60})"* && "$saida" == *"$(printf "9%.0s" {1..40})…"* ]]'
 
 sec "sshd_diverge (saída de sshd -T de exemplo)"
 FIX_OK=$'port 44320\npermitrootlogin no\npasswordauthentication no\nkbdinteractiveauthentication no\npubkeyauthentication yes\nmaxauthtries 3\nx11forwarding no\nallowtcpforwarding no\nallowagentforwarding no\nlogingracetime 30\nclientaliveinterval 300\nclientalivecountmax 2\nallowusers admin\nallowusers backup'
@@ -362,6 +362,21 @@ for CASO in "PasswordAuthentication yes|PasswordAuthentication" "PermitRootLogin
 done
 D=$(novo_ssh porta22); printf 'Port 22\n' > "$D/conf.d/01-outro.conf"
 t "Port: outro arquivo escutando também na 22 → PARA e cita o arquivo" bash -c 'out=$(RAIZ="$1" bash "$2" "$3"); grep -q "^PARAR|SSH Port: .*01-outro.conf" <<<"$out"' _ "$RAIZ" "$TMP/cfl.sh" "$D"
+D=$(novo_ssh porta-igual); printf 'Port 44320\n' > "$D/conf.d/01-outro.conf"
+cfl "$D" > "$TMP/o.porta-igual"
+t "Port 44320 repetida em outro arquivo + baseline 44320: segue SEM aviso (o sshd escuta uma vez)" bash -c '[[ ! -s "$1" ]]' _ "$TMP/o.porta-igual"
+t "...com o 10-baseline.conf aplicado, o sshd real lista a porta DUAS vezes e o sshd_diverge passa mesmo assim" bash -c '
+  RAIZ="$1" bash "$2" "$3" && [[ $(sshd -T -f "$3/sshd_config" -C user=daemon,host=localhost,addr=127.0.0.1 | grep -c "^port 44320$") == 2 ]]' _ "$RAIZ" "$TMP/dv.sh" "$D"
+D=$(novo_ssh porta-2222); printf 'Port 2222\n' > "$D/conf.d/01-outro.conf"
+t "01-outro.conf 'Port 2222': PARA (porta a mais) citando o arquivo" bash -c '
+  out=$(RAIZ="$1" bash "$2" "$3"); grep -q "^PARAR|SSH Port: escolhido 44320, mas o sshd escutaria em: 2222 44320 (porta a mais: 2222; 01-outro.conf define Port; Port ACUMULA" <<<"$out"' _ "$RAIZ" "$TMP/cfl.sh" "$D"
+D=$(novo_ssh porta-mista); printf 'Port 44320\nPort 2222\nPort 44320\n' > "$D/conf.d/01-outro.conf"
+t "Port 44320 + 2222 + 44320: só a 2222 é 'a mais'" bash -c 'out=$(RAIZ="$1" bash "$2" "$3"); grep -q "porta a mais: 2222;" <<<"$out" && ! grep -q "porta a mais: 2222 44320\|porta a mais: 44320" <<<"$out"' _ "$RAIZ" "$TMP/cfl.sh" "$D"
+t "ssh_portas_dif: conjunto sem repetição" no_baseline '
+  ssh_portas_dif 44320 "44320" && ssh_portas_dif 44320 "44320 44320 44320" && ssh_portas_dif 44320 "" >/dev/null; [[ $? -ne 0 ]]
+  [[ $(ssh_portas_dif 44320 "2222 44320 2222") == "porta a mais: 2222" ]]
+  [[ $(ssh_portas_dif 44320 "2222") == "porta a mais: 2222; falta a escolhida: 44320" ]]
+  [[ $(ssh_portas_dif 44320 "") == "falta a escolhida: 44320" ]]'
 D=$(novo_ssh allowusers); printf 'AllowUsers intruso\n' > "$D/conf.d/01-outro.conf"
 t "AllowUsers: outro arquivo SOMA usuário → PARA e cita arquivo e usuário" bash -c 'out=$(RAIZ="$1" bash "$2" "$3"); grep -q "^PARAR|SSH AllowUsers: .*01-outro.conf acrescenta intruso" <<<"$out"' _ "$RAIZ" "$TMP/cfl.sh" "$D"
 D=$(novo_ssh restritivo); printf 'MaxAuthTries 2\nPasswordAuthentication no\n' > "$D/conf.d/01-outro.conf"
@@ -432,6 +447,10 @@ ssh_confere_valor logingracetime 30 "$(sshd -T -f "$D/sshd_config" -C user=daemo
 echo "RES $PASS $FAIL $AVISO"
 EOT
 t "verify: diferença SEM dono conhecido (10-baseline.conf editado) → FALHA" bash -c 'out=$(RAIZ="$1" bash "$2" "$3"); grep -q "^RES 0 1 0$" <<<"$out" && grep -q "10-baseline.conf foi editado" <<<"$out"' _ "$RAIZ" "$TMP/vf_adulterado.sh" "$D"
+D=$(novo_ssh vf-porta-igual); printf 'Port 44320\n' > "$D/conf.d/01-outro.conf"
+t "verify: Port repetida com o mesmo valor → OK (11 OK, 0 FALHA, 0 AVISO)" bash -c 'vf=$(RAIZ="$1" bash "$2" "$3"); grep -q "^RES 11 0 0$" <<<"$vf"' _ "$RAIZ" "$TMP/vf.sh" "$D"
+D=$(novo_ssh vf-porta-2222); printf 'Port 2222\n' > "$D/conf.d/01-outro.conf"
+t "verify: Port 2222 de outro arquivo → FALHA 'porta a mais' citando o arquivo" bash -c 'vf=$(RAIZ="$1" bash "$2" "$3" 2>&1); grep -q "port esperado 44320, efetivo 2222 44320 (porta a mais: 2222; 01-outro.conf define Port" <<<"$vf"' _ "$RAIZ" "$TMP/vf.sh" "$D"
 t "verify: o bloco py_ssh/ssh_* é CÓPIA EXATA do baseline.sh" bash -c '
   a=$(source ./baseline.sh; declare -f py_ssh ssh_nome ssh_menos_seguro ssh_classe ssh_quem ssh_quem_todos)
   b=$(source ./baseline-verify.sh; declare -f py_ssh ssh_nome ssh_menos_seguro ssh_classe ssh_quem ssh_quem_todos)
@@ -448,6 +467,143 @@ t "o resumo lista os avisos de conflito de conforto"              bash -c 'sed -
 else
   if [[ ${BASELINE_EXIGE_SSHD:-0} == 1 ]]; then N=$((N+1)); FALHAS=$((FALHAS+1)); echo "  FALHA sshd ausente: testes de conflito de SSH não rodaram"; else echo "  skip  sshd não instalado"; fi
 fi
+
+
+sec "2) Abortado: a versão nova do verify; o verify imprime a PRÓPRIA versão"
+t "pare: aponta para o baseline-verify.sh ao lado do script"  bash -c 'out=$(source ./baseline.sh; LOG=/x; pare "teste" 2>&1); rc=$?; [[ $rc -ne 0 && "$out" == *"Abortado."* && "$out" == *"Para conferir com a versão nova: sudo bash '"$RAIZ"'/baseline-verify.sh"* ]]'
+mkdir -p "$TMP/sozinho"; cp baseline.sh "$TMP/sozinho/"
+t "pare: sem baseline-verify.sh ao lado, manda baixar o da mesma versão" bash -c 'out=$(source "$1"; LOG=/x; pare "teste" 2>&1); [[ "$out" == *"baixe o baseline-verify.sh da v2.2.0"* && "$out" == *"o '"'"'sudo baseline-verify'"'"' instalado pode ser o da versão anterior"* ]]' _ "$TMP/sozinho/baseline.sh"
+t "toda mensagem 'Abortado' sai pelo pare (um único lugar)"      bash -c '[[ $(grep -c "Abortado" baseline.sh) == 1 ]] && grep -n "Abortado" baseline.sh | grep -q "echo \"Abortado. Log"'
+t "conflito de SSH e autoteste abortam via pare"                  bash -c 'grep -q "pare \"Nada foi alterado (conflito de SSH" baseline.sh && grep -q "pare \"Autoteste do SSH falhou" baseline.sh'
+t "verify imprime a SUA versão e a de quem aplicou o padrão"      bash -c 'source ./baseline-verify.sh; declare -A E=([BASELINE_VERSAO]=2.1.0); out=$(verify_cabecalho); [[ "$out" == *"baseline-verify v$VERIFY_VERSAO "* && "$out" == *"padrão aplicado pela v2.1.0"* ]]'
+t "VERIFY_VERSAO == VERSAO do baseline.sh"                        bash -c '[[ $(sed -n "s/^VERIFY_VERSAO=\"\([^\"]*\)\".*/\1/p" baseline-verify.sh) == $(sed -n "s/^VERSAO=\"\([^\"]*\)\".*/\1/p" baseline.sh) ]]'
+t "verify: ssh_portas_dif/snmpd_de_outro são CÓPIAS EXATAS do baseline.sh" bash -c '
+  a=$(source ./baseline.sh; declare -f ssh_portas_dif snmpd_de_outro)
+  b=$(source ./baseline-verify.sh; declare -f ssh_portas_dif snmpd_de_outro)
+  [[ -n $a && "$a" == "$b" ]]'
+
+sec "3) SNMP com snmpd.conf de OUTRO produto"
+SS_EXATO=$'UNCONN 0 0 179.125.120.36:161 0.0.0.0:*\nUNCONN 0 0 127.0.0.1:161 0.0.0.0:*'
+SS_TODOS=$'UNCONN 0 0 0.0.0.0:161 0.0.0.0:*\nUNCONN 0 0 [::]:161 [::]:*'
+SS_V6=$'UNCONN 0 0 [::]:161 [::]:*'
+SS_NADA=$'UNCONN 0 0 127.0.0.53%lo:53 0.0.0.0:*'
+SS_PARECIDO=$'UNCONN 0 0 1179.125.120.36:161 0.0.0.0:*'
+t "snmp_cobre: endereço exato"                       no_verify '[[ $(snmp_cobre "$1" 179.125.120.36) == exato && $(snmp_cobre "$1" 127.0.0.1) == exato ]]' "$SS_EXATO"
+t "snmp_cobre: 0.0.0.0:161 / [::]:161 cobrem os endereços ('todos')" no_verify '[[ $(snmp_cobre "$1" 179.125.120.36) == todos && $(snmp_cobre "$1" 127.0.0.1) == todos ]]' "$SS_TODOS"
+t "snmp_cobre: SÓ 0.0.0.0:161 cobre (sem [::])"        no_verify '[[ $(snmp_cobre "$1" 179.125.120.36) == todos && $(snmp_cobre "$1" 127.0.0.1) == todos ]]' $'UNCONN 0 0 0.0.0.0:161 0.0.0.0:*'
+t "snmp_cobre: SÓ *:161 cobre"                           no_verify '[[ $(snmp_cobre "$1" 127.0.0.1) == todos ]]' $'UNCONN 0 0 *:161 *:*'
+t "snmp_cobre: outra porta em 0.0.0.0 (0.0.0.0:1610) NÃO cobre" no_verify '[[ -z $(snmp_cobre "$1" 127.0.0.1) ]]' $'UNCONN 0 0 0.0.0.0:1610 0.0.0.0:*'
+t "snmp_cobre: só [::]:161 também cobre (dual-stack)"  no_verify '[[ $(snmp_cobre "$1" 127.0.0.1) == todos ]]' "$SS_V6"
+t "snmp_cobre: sem 161 → nada"                         no_verify '[[ -z $(snmp_cobre "$1" 127.0.0.1) ]]' "$SS_NADA"
+t "snmp_cobre: 1179.125.120.36 NÃO casa com 179.125.120.36" no_verify '[[ -z $(snmp_cobre "$1" 179.125.120.36) ]]' "$SS_PARECIDO"
+
+printf '# Gerado por baseline v2.2.0 em x — somente SNMPv3\nagentaddress udp:179.125.120.36:161,udp:127.0.0.1:161\nsysLocation "Sala"\nrouser monitorv3 priv\n' > "$TMP/snmpd.baseline"
+printf 'agentAddress udp:161,udp6:161\nsysLocation Datacenter_Central\nsysContact suporte@exemplo.com.br\nrouser monitorv3 priv\n' > "$TMP/snmpd.outro"
+printf 'agentAddress udp:161,udp6:161\nsysLocation X\n' > "$TMP/snmpd.outro_sem_rouser"
+printf 'agentAddress udp:161\nrocommunity public\nrouser monitorv3 priv\n' > "$TMP/snmpd.outro_community"
+printf '' > "$TMP/snmpd.vazio"
+cat > "$ST/dpkg-query" <<'EOT'
+#!/usr/bin/env bash
+[[ -n "${STUB_MD5:-}" ]] && printf ' %s %s\n' "$STUB_SNMPD" "$STUB_MD5"
+exit 0
+EOT
+chmod +x "$ST/dpkg-query"
+t "snmpd_de_outro: arquivo do baseline (marca '# Gerado por baseline v') → não é de outro"  no_baseline 'SNMPD_ARQ=$1; ! snmpd_de_outro' "$TMP/snmpd.baseline"
+t "snmpd_de_outro: arquivo de outro produto → é de outro"                                    no_baseline 'SNMPD_ARQ=$1; snmpd_de_outro' "$TMP/snmpd.outro"
+t "snmpd_de_outro: vazio ou inexistente → não é de outro"                                   no_baseline 'SNMPD_ARQ=$1; ! snmpd_de_outro && SNMPD_ARQ=/nao/existe && ! snmpd_de_outro' "$TMP/snmpd.vazio"
+M5=$(md5sum "$TMP/snmpd.outro" | cut -d' ' -f1)
+t "snmpd_de_outro: arquivo de fábrica do pacote (md5 do dpkg) → NÃO conta como de outro produto" env STUB_MD5="$M5" STUB_SNMPD="$TMP/snmpd.outro" PATH="$ST:$PATH" bash -c 'source "$1"; SNMPD_ARQ=$2; ! snmpd_de_outro' _ "$RAIZ/baseline.sh" "$TMP/snmpd.outro"
+t "snmpd_de_outro: conffile do pacote MODIFICADO (md5 diferente) → é de outro" env STUB_MD5="00000000000000000000000000000000" STUB_SNMPD="$TMP/snmpd.outro" PATH="$ST:$PATH" bash -c 'source "$1"; SNMPD_ARQ=$2; snmpd_de_outro' _ "$RAIZ/baseline.sh" "$TMP/snmpd.outro"
+
+cp "$TMP/snmpd.outro" "$TMP/snmpd.intocado"
+t "baseline.sh NÃO sobrescreve o snmpd.conf de outro produto (conteúdo idêntico, retorno 1)" no_baseline 'SNMPD_ARQ=$1; SNMPD_OUTRO=sim; V4=1.2.3.4; SNMP_LOCATION=X; SNMP_CONTACT=y; SNMP_USER=u; ! snmpd_gravar_conf && cmp -s "$1" "$2"' "$TMP/snmpd.intocado" "$TMP/snmpd.outro"
+t "...e grava o do baseline (com a marca) quando não é de outro"   no_baseline 'SNMPD_ARQ=$1; SNMPD_OUTRO=nao; V4=1.2.3.4; SNMP_LOCATION=Sala; SNMP_CONTACT=y; SNMP_USER=monitorv3; snmpd_gravar_conf && head -1 "$1" | grep -q "^# Gerado por baseline v2.2.0" && grep -qx "rouser monitorv3 priv" "$1"' "$TMP/snmpd.novo"
+t "resumo: 'snmpd.conf de outro produto — mantido; só o usuário SNMPv3 é conferido'" bash -c 'sed -n "/RESUMO — nada foi alterado/,/read -rp \"Aplicar/p" baseline.sh | grep -q "snmpd.conf de outro produto — mantido; só o usuário SNMPv3 é conferido"'
+t "com snmpd.conf de outro produto o baseline NÃO pede as senhas"  bash -c '
+  a=$(grep -n "if \[\[ \"\$SNMPD_OUTRO\" == sim \]\]; then" baseline.sh | head -1 | cut -d: -f1)
+  b=$(awk -v a="$a" "NR>a && /^  else\$/{print NR; exit}" baseline.sh)
+  [[ -n $a && -n $b ]] && ! sed -n "${a},${b}p" baseline.sh | grep -q "ler_senha"'
+t "a decisão 'de outro produto' vem ANTES de instalar pacotes (o apt cria um snmpd.conf de fábrica)" bash -c 'a=$(grep -n "snmpd_de_outro && SNMPD_OUTRO=sim" baseline.sh | cut -d: -f1); b=$(grep -n "install \"\${PKGS\[@\]}\"" baseline.sh | cut -d: -f1); [[ -n $a && -n $b && $a -lt $b ]]'
+t "etapa 4/4: sem sobrescrever (snmpd_gravar_conf) quando de outro produto" bash -c 'sed -n "/^info \"4\/4 SNMPv3\"/,/^# REGISTRO/p" baseline.sh | grep -q "if ! snmpd_gravar_conf" && ! grep -n "cat > /etc/snmp/snmpd.conf" baseline.sh'
+
+cfg() { # cfg CONF "SS" -> roda confere_snmp_conf e imprime RES PASS FAIL AVISO
+  SNMPD_ARQ_T=$1 SS_T=$2 EXTRA_T=${3:-} no_verify 'SNMPD_ARQ=$SNMPD_ARQ_T; declare -A E=([SNMP_LOCATION]=Datacenter_Central [SNMP_CONTACT]=suporte@exemplo.com.br); PASS=0; FAIL=0; AVISO=0
+    confere_snmp_conf "$SS_T" 179.125.120.36 monitorv3 2>&1; echo "RES $PASS $FAIL $AVISO"'
+}
+cfg "$TMP/snmpd.baseline" "$SS_EXATO" > "$TMP/c1.out"
+t "verify: snmpd.conf do baseline com endereços exatos → 4 OK, 0 FALHA"  grep -q '^RES 4 0 0$' "$TMP/c1.out"
+cfg "$TMP/snmpd.baseline" "$SS_NADA" > "$TMP/c2.out"
+t "verify: snmpd.conf do baseline que NÃO escuta no IP → FALHA (como antes)" bash -c 'grep -q "^RES 2 2 0$" "$1" && grep -q "FALHA.* snmpd escutando em 179.125.120.36:161" "$1"' _ "$TMP/c2.out"
+cfg "$TMP/snmpd.baseline" "$SS_TODOS" > "$TMP/c3.out"
+t "verify: escuta em todos (0.0.0.0/[::]:161) = OK, dizendo 'inclui X'"  bash -c 'grep -q "^RES 4 0 0$" "$1" && grep -q "snmpd escuta em todos os endereços (0.0.0.0/\[::\]:161) — inclui 179.125.120.36:161" "$1" && grep -q "inclui 127.0.0.1:161" "$1"' _ "$TMP/c3.out"
+cfg "$TMP/snmpd.outro" "$SS_TODOS" > "$TMP/c4.out"
+t "verify: snmpd.conf de OUTRO produto escutando em todos → sem FALHA e diz 'é de outro produto'" bash -c 'grep -q "snmpd.conf é de outro produto" "$1" && grep -q "^RES .* 0 [0-9]*$" "$1" && grep -q "^RES 6 0 0$" "$1"' _ "$TMP/c4.out"
+cfg "$TMP/snmpd.outro" "$SS_NADA" > "$TMP/c5.out"
+t "verify: snmpd.conf de OUTRO produto que não escuta nos endereços → só AVISO informativo (nunca FALHA)" bash -c 'grep -q "^RES 4 0 2$" "$1" && grep -q "AVISO.*snmpd não escuta em 179.125.120.36:161 (snmpd.conf de outro produto: informativo)" "$1"' _ "$TMP/c5.out"
+cfg "$TMP/snmpd.outro_sem_rouser" "$SS_TODOS" > "$TMP/c6.out"
+t "verify: de outro produto SEM 'rouser <usuário> priv' continua FALHA"      bash -c 'grep -q "FALHA.* rouser monitorv3 priv" "$1"' _ "$TMP/c6.out"
+cfg "$TMP/snmpd.outro_community" "$SS_TODOS" > "$TMP/c7.out"
+t "verify: de outro produto COM community (v1/v2c) continua FALHA"           bash -c 'grep -q "FALHA.* Sem community" "$1"' _ "$TMP/c7.out"
+printf 'agentAddress udp:161,udp6:161\nsysLocation Outro_Lugar\nsysContact outro@x\nrouser monitorv3 priv\n' > "$TMP/snmpd.diverge"
+cfg "$TMP/snmpd.diverge" "$SS_TODOS" > "$TMP/c8.out"
+t "verify: localização/contato de outro produto que não batem → 2 AVISOS, nunca FALHA" bash -c 'grep -q "^RES 4 0 2$" "$1" && grep -q "AVISO.*sysLocation Datacenter_Central no snmpd.conf (informativo)" "$1" && grep -q "AVISO.*sysContact suporte@exemplo.com.br no snmpd.conf (informativo)" "$1"' _ "$TMP/c8.out"
+
+sec "4) Teste real do SNMP no verify: prompts, motivo da falha, local e IP, senhas fora do argv"
+SEC_A='AuthSecret!1x'; SEC_P='PrivSecret!2y'
+cat > "$ST/snmpget" <<'EOT'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$STUB_SNMP_ARGS"
+alvo=${@: -2:1}; var="STUB_MODE_${alvo//./_}"; modo=${!var:-ok}
+cp "$SNMPCONFPATH/snmp.conf" "$STUB_SNMP_CONF" 2>/dev/null
+stat -c %a "$SNMPCONFPATH/snmp.conf" > "$STUB_SNMP_MODE"; stat -c %a "$SNMPCONFPATH" > "$STUB_SNMP_DMODE"; echo "$SNMPCONFPATH" > "$STUB_SNMP_DIR"
+case $modo in
+  ok) echo "DISMAN-EVENT-MIB::sysUpTimeInstance = Timeticks: (123) 0:00:01.23"; exit 0;;
+  timeout) echo "Timeout: No Response from $alvo." >&2; exit 1;;
+  auth) echo "snmpget: Authentication failure (incorrect password, community or key)" >&2; exit 1;;
+  digest) echo "snmpget: wrong digest" >&2; exit 1;;
+  decrypt) echo "snmpget: Decryption error" >&2; exit 1;;
+  user) echo "snmpget: Unknown user name" >&2; exit 1;;
+  vaza) echo "snmpget: erro estranho com $(sed -n 's/^defAuthPassphrase //p' "$SNMPCONFPATH/snmp.conf") e $(sed -n 's/^defPrivPassphrase //p' "$SNMPCONFPATH/snmp.conf")" >&2; exit 1;;
+esac
+EOT
+chmod +x "$ST/snmpget"
+export STUB_SNMP_ARGS="$TMP/sn.args" STUB_SNMP_CONF="$TMP/sn.conf" STUB_SNMP_MODE="$TMP/sn.mode" STUB_SNMP_DMODE="$TMP/sn.dmode" STUB_SNMP_DIR="$TMP/sn.dir"
+sg() { # sg MODO_LOCAL MODO_IP  -> executa snmp_confere_real e imprime tudo + RES
+  STUB_MODE_127_0_0_1=$1 STUB_MODE_179_125_120_36=$2 PATH="$ST:$PATH" bash -c 'source "$1"; PASS=0; FAIL=0; AVISO=0; snmp_confere_real monitorv3 "$2" "$3" 179.125.120.36 2>&1; echo "RES $PASS $FAIL $AVISO"' _ "$RAIZ/baseline-verify.sh" "$SEC_A" "$SEC_P"
+}
+for CASO in "timeout|Timeout (rede, UFW ou endereço de escuta do snmpd)" "auth|Authentication failure / wrong digest (senha de AUTENTICAÇÃO)" "digest|Authentication failure / wrong digest (senha de AUTENTICAÇÃO)" \
+            "decrypt|Decryption error (senha de CRIPTOGRAFIA)" "user|Unknown user name (usuário SNMPv3 errado ou inexistente)"; do
+  MODO=${CASO%%|*}; ESPERA=${CASO#*|}
+  t "motivo da falha ($MODO): '$ESPERA'" bash -c 'STUB_MODE_127_0_0_1=$1 PATH="$2:$PATH" bash -c "source $3/baseline-verify.sh; snmp_get 127.0.0.1 monitorv3 \"\$1\" \"\$2\"; echo \"\$SNMP_MOTIVO\"" _ "$4" "$5" | grep -qxF -- "$6"' _ "$MODO" "$ST" "$RAIZ" "$SEC_A" "$SEC_P" "$ESPERA"
+done
+sg ok ok > "$TMP/s1.out"
+t "local e IP respondem → 2 OK"                                    grep -q '^RES 2 0 0$' "$TMP/s1.out"
+sg ok timeout > "$TMP/s2.out"
+t "só o local responde → 'responde local, não no IP — confira o agentAddress e o UFW'" bash -c 'grep -q "^RES 1 1 0$" "$1" && grep -q "snmpget SNMPv3 em 179.125.120.36: responde local, não no IP — confira o agentAddress e o UFW (motivo: Timeout" "$1"' _ "$TMP/s2.out"
+sg timeout ok > "$TMP/s3.out"
+t "só o IP responde → diz 'responde no IP, não no local'"          bash -c 'grep -q "^RES 1 1 0$" "$1" && grep -q "em 127.0.0.1: Timeout.*(responde no IP, não no local)" "$1"' _ "$TMP/s3.out"
+sg auth decrypt > "$TMP/s4.out"
+t "os dois falham → um motivo para cada endereço"                  bash -c 'grep -q "^RES 0 2 0$" "$1" && grep -q "em 127.0.0.1: Authentication failure" "$1" && grep -q "em 179.125.120.36: Decryption error" "$1"' _ "$TMP/s4.out"
+sg vaza vaza > "$TMP/s5.out"
+t "motivo desconhecido que ECOA as senhas: elas são mascaradas (***)" bash -c 'grep -q "motivo não reconhecido: .*\*\*\*" "$1" && ! grep -qF -- "$2" "$1" && ! grep -qF -- "$3" "$1"' _ "$TMP/s5.out" "$SEC_A" "$SEC_P"
+cat "$TMP/s1.out" "$TMP/s2.out" "$TMP/s3.out" "$TMP/s4.out" "$TMP/s5.out" > "$TMP/s.todos"
+t "nenhuma senha aparece em NENHUMA saída do teste (sucesso, falhas, motivos)" bash -c '! grep -qF -- "$2" "$1" && ! grep -qF -- "$3" "$1"' _ "$TMP/s.todos" "$SEC_A" "$SEC_P"
+rm -f "$STUB_SNMP_ARGS"; sg ok ok >/dev/null
+t "(d) senhas NÃO vão no argv do snmpget (nem -A/-X/-u/-a/-x)"    bash -c '! grep -qF -- "$2" "$1" && ! grep -qF -- "$3" "$1" && ! grep -qE "(^| )-(A|X|u|a|x|l)( |$)" "$1" && [[ $(wc -l < "$1") == 2 ]]' _ "$STUB_SNMP_ARGS" "$SEC_A" "$SEC_P"
+t "(d) as senhas estavam num snmp.conf 0600 (pasta 0700) apontado por SNMPCONFPATH" bash -c 'grep -qx "defAuthPassphrase $1" "$3" && grep -qx "defPrivPassphrase $2" "$3" && [[ $(cat "$4") == 600 && $(cat "$5") == 700 ]]' _ "$SEC_A" "$SEC_P" "$STUB_SNMP_CONF" "$STUB_SNMP_MODE" "$STUB_SNMP_DMODE"
+t "(d) o arquivo temporário é apagado logo depois do uso"          bash -c 'd=$(cat "$1"); [[ -n $d && ! -e "$d" ]]' _ "$STUB_SNMP_DIR"
+mkdir -p "$TMP/tv"; : > "$TMP/tv/snmp.conf"
+t "(d) trap: limpa_v apaga a pasta se o verify morrer no meio"    no_verify 'TMPV=("$1"); limpa_v; [[ ! -e "$1" ]]' "$TMP/tv"
+t "(d) política: nenhum snmpget com -A/-X/-u nos scripts"           bash -c '! grep -nE "snmpget[^|#]* -(A|X|u|a|x)( |$)" baseline.sh baseline-verify.sh'
+t "(d) política: o verify registra a pasta temporária no trap (EXIT)" bash -c 'grep -q "^trap limpa_v EXIT" baseline-verify.sh && grep -q "TMPV+=(\"\$d\")" baseline-verify.sh'
+
+printf 'abc123\nxyz9\n' > "$TMP/in.senhas"
+t "(a) ler_oculto: lê as duas senhas sem eco e preenche as variáveis" bash -c 'source "$1"; { ler_oculto "Senha de AUTENTICAÇÃO (Enter pula): " A; ler_oculto "Senha de CRIPTOGRAFIA: " P; } < "$2" 2> "$3" >/dev/null; [[ $A == abc123 && $P == xyz9 ]]' _ "$RAIZ/baseline-verify.sh" "$TMP/in.senhas" "$TMP/err.senhas"
+t "(a) cada pergunta numa linha própria, com '(digitado: N caracteres)' depois" bash -c '
+  [[ "$(cat "$1")" == $'"'"'  Senha de AUTENTICAÇÃO (Enter pula): \n  (digitado: 6 caracteres)\n  Senha de CRIPTOGRAFIA: \n  (digitado: 4 caracteres)'"'"' ]]' _ "$TMP/err.senhas"
+t "(a) nunca o conteúdo digitado"                                  bash -c '! grep -q "abc123\|xyz9" "$1"' _ "$TMP/err.senhas"
+t "(a) Enter vazio pula: '(digitado: 0 caracteres)'"               bash -c 'source "$1"; printf "\n" | { ler_oculto "Senha: " A; } 2>&1 >/dev/null | grep -qx "  (digitado: 0 caracteres)"' _ "$RAIZ/baseline-verify.sh"
+t "(a) o verify usa ler_oculto para as duas senhas e o teste nos dois endereços" bash -c 'grep -q "ler_oculto \"Senha de AUTENTICAÇÃO (Enter pula): \" A" baseline-verify.sh && grep -q "ler_oculto \"Senha de CRIPTOGRAFIA: \" P" baseline-verify.sh && grep -q "snmp_confere_real \"\$SU\" \"\$A\" \"\$P\" \"\$V4\"" baseline-verify.sh'
 
 sec "Versão marcada: SHA256SUMS"
 t "SHA256SUMS confere com os scripts (regenere: sha256sum baseline.sh baseline-verify.sh > SHA256SUMS)" sha256sum -c --quiet SHA256SUMS
