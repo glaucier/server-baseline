@@ -28,6 +28,8 @@ LOG=/root/baseline-$TS.log
 BK=/root/baseline-backup-$TS
 SSHD_PRINCIPAL=/etc/ssh/sshd_config
 SSHD_ARQ=/etc/ssh/sshd_config.d/10-baseline.conf
+SNMPD_ARQ=/etc/snmp/snmpd.conf
+SNMPD_OUTRO=nao
 SSHD_ANTIGO=/etc/ssh/sshd_config.d/10-g2-hardening.conf
 VOLTA_MIN=5
 
@@ -35,7 +37,17 @@ VOLTA_MIN=5
 info() { echo -e "\n\e[1;36m==> $*\e[0m"; }
 ok()   { echo -e "  \e[32m[OK]\e[0m $*"; }
 aviso(){ echo -e "  \e[33m[AVISO]\e[0m $*"; }
-pare() { echo -e "  \e[31m[ERRO]\e[0m $*"; echo "Abortado. Log: $LOG"; exit 1; }
+PASTA_SCRIPT=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
+pare() {
+  echo -e "  \e[31m[ERRO]\e[0m $*"; echo "Abortado. Log: $LOG"
+  # O baseline-verify só é instalado em /usr/local/sbin no fim (4/4): depois de abortar, o instalado é o da versão ANTERIOR.
+  if [[ -f "$PASTA_SCRIPT/baseline-verify.sh" ]]; then
+    echo "Para conferir com a versão nova: sudo bash $PASTA_SCRIPT/baseline-verify.sh   (o 'sudo baseline-verify' instalado pode ser o da versão anterior)"
+  else
+    echo "Para conferir com a versão nova: baixe o baseline-verify.sh da v$VERSAO e rode: sudo bash baseline-verify.sh   (o 'sudo baseline-verify' instalado pode ser o da versão anterior)"
+  fi
+  exit 1
+}
 
 ajuda() {
   sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
@@ -352,6 +364,18 @@ else:
 PY
 }
 
+# Portas: compara o CONJUNTO (sem repetição). "Port 44320" repetido em outro arquivo não muda nada (o sshd escuta uma vez).
+# ssh_portas_dif ESCOLHIDA "EFETIVAS" -> retorno 1 e a explicação se houver porta A MAIS ou faltar a escolhida
+ssh_portas_dif() {
+  local esc=$1 ef p mais="" falta=""
+  ef=$(tr ' ' '\n' <<<"$2" | sed '/^$/d' | sort -nu | tr '\n' ' '); ef=${ef% }
+  for p in $ef; do [[ "$p" == "$esc" ]] || mais+="${mais:+ }$p"; done
+  [[ " $ef " == *" $esc "* ]] || falta=$esc
+  [[ -z "$mais$falta" ]] && return 0
+  echo "${mais:+porta a mais: $mais}${mais:+${falta:+; }}${falta:+falta a escolhida: $falta}"
+  return 1
+}
+
 # Nome canônico (como no sshd_config) de uma diretiva em minúsculas
 ssh_nome() {
   case $1 in
@@ -420,7 +444,7 @@ sshd_diverge() {
   while IFS= read -r par; do
     grep -qxF -- "$par" <<<"$saida" || { echo "    esperado '$par' — efetivo: '$(grep -m1 "^${par%% *} " <<<"$saida")'"; falta=1; }
   done < <(sshd_pares)
-  efet=$(awk '$1=="port"{print $2}' <<<"$saida" | sort -n | tr '\n' ' ')
+  efet=$(awk '$1=="port"{print $2}' <<<"$saida" | sort -nu | tr '\n' ' ')
   [[ "$efet" == "$SSH_PORT " ]] || { echo "    portas efetivas: ${efet:-(nenhuma)}— esperado: $SSH_PORT"; falta=1; }
   efet=$(awk '$1=="allowusers"{print $2}' <<<"$saida" | sort | tr '\n' ' ')
   esp=$(tr ' ' '\n' <<<"$SSH_USUARIOS" | sort | tr '\n' ' ')
@@ -451,7 +475,7 @@ gerar_sshd_conf() {
 # e seguir) e SSH_OVERRIDE (o valor que vence, que o autoteste passa a esperar). Não escreve em arquivo de ninguém.
 SSH_CONF_PARAR=(); SSH_CONF_AVISO=()
 ssh_conflitos() {
-  local cand plano real k want rv cls nome quem rc extras
+  local cand plano real k want rv cls nome quem rc extras pdif
   SSH_CONF_PARAR=(); SSH_CONF_AVISO=(); SSH_OVERRIDE=()
   cand=$(mktemp) && plano=$(mktemp) || { SSH_CONF_AVISO+=("sem espaço para os temporários: conflitos de SSH só serão conferidos depois de aplicar"); return 0; }
   TMPS+=("$cand" "$plano")
@@ -468,9 +492,9 @@ ssh_conflitos() {
     nome=$(ssh_nome "$k")
     case $k in
       port)
-        rv=$(awk '$1=="port"{print $2}' <<<"$real" | sort -n | tr '\n' ' '); rv=${rv% }
-        [[ "$rv" == "$want" ]] && continue
-        SSH_CONF_PARAR+=("SSH $nome: escolhido $want, mas o sshd escutaria em: ${rv:-nenhuma} ($(ssh_quem_todos "$k" "$cand") define Port; Port ACUMULA entre arquivos) — a porta/UFW do baseline não valeriam")
+        rv=$(awk '$1=="port"{print $2}' <<<"$real" | sort -nu | tr '\n' ' '); rv=${rv% }
+        pdif=$(ssh_portas_dif "$want" "$rv") && continue
+        SSH_CONF_PARAR+=("SSH $nome: escolhido $want, mas o sshd escutaria em: ${rv:-nenhuma} ($pdif; $(ssh_quem_todos "$k" "$cand") define Port; Port ACUMULA entre arquivos) — a porta/UFW do baseline não valeriam")
         ;;
       *)
         rv=$(awk -v k="$k" '$1==k{print $2; exit}' <<<"$real")
@@ -491,6 +515,30 @@ ssh_conflitos() {
     extras=$(comm -13 <(tr ' ' '\n' <<<"$want") <(tr ' ' '\n' <<<"$rv") | tr '\n' ' ')
     SSH_CONF_PARAR+=("SSH AllowUsers: escolhido $SSH_USUARIOS, mas $(ssh_quem_todos allowusers "$cand") ${extras:+acrescenta ${extras% } }(AllowUsers ACUMULA entre arquivos): efetivo = ${rv:-ninguém} — acesso diferente do escolhido")
   fi
+}
+
+# ---- SNMP: o baseline NUNCA sobrescreve um snmpd.conf de outro produto (como no SSH) --------------------------------
+# 0 = o snmpd.conf existe, tem conteúdo, NÃO foi gerado pelo baseline e NÃO é o arquivo original do pacote snmpd (md5 do dpkg)
+snmpd_de_outro() {
+  local md5 pk
+  [[ -s "$SNMPD_ARQ" ]] || return 1
+  head -1 "$SNMPD_ARQ" | grep -q '^# Gerado por baseline v' && return 1
+  pk=$(dpkg-query -W -f='${Conffiles}\n' snmpd 2>/dev/null | awk -v f="$SNMPD_ARQ" '$1==f{print $2}')
+  md5=$(md5sum "$SNMPD_ARQ" 2>/dev/null | awk '{print $1}')
+  [[ -n "$pk" && "$pk" == "$md5" ]] && return 1
+  return 0
+}
+# Grava o snmpd.conf do baseline. Retorno 1 (sem tocar em nada) se o que existe é de outro produto (SNMPD_OUTRO=sim,
+# decidido ANTES de instalar pacotes: o apt cria um snmpd.conf de fábrica que não deve contar como "de outro produto").
+snmpd_gravar_conf() {
+  [[ "$SNMPD_OUTRO" == sim ]] && return 1
+  cat > "$SNMPD_ARQ" <<EOF
+# Gerado por baseline v$VERSAO em $(date '+%F %T') — somente SNMPv3 (authPriv), leitura
+agentaddress udp:$V4:161,udp:127.0.0.1:161
+sysLocation "$SNMP_LOCATION"
+sysContact $SNMP_CONTACT
+rouser $SNMP_USER priv
+EOF
 }
 
 # Autoteste (depois do restart, antes de pedir o OK). Dois níveis:
@@ -984,19 +1032,24 @@ if [[ "$SNMP" == sim ]]; then
   pergunta SNMP_USER "Usuário SNMPv3" "O mesmo cadastrado no sensor do monitoramento." "" "$(p SNMP_USER)" val_texto
   pergunta SNMP_LOCATION "Localização (sysLocation)" "Onde o servidor está; aparece no monitoramento (sem espaço é mais seguro)." "Sala_Servidores" "$(p SNMP_LOCATION)" val_texto
   pergunta SNMP_CONTACT "Contato (sysContact)" "E-mail do responsável." "suporte@seudominio" "$(p SNMP_CONTACT)" val_texto
-  TEM_USM=$(grep -c '^usmUser' /var/lib/snmp/snmpd.conf 2>/dev/null); TEM_USM=${TEM_USM:-0}
-  if (( TEM_USM > 0 )) && [[ "$(p SNMP_USER)" == "$SNMP_USER" ]]; then
-    read -rp "  O usuário $SNMP_USER já existe. Trocar as senhas? (s/N): " r </dev/tty
-    [[ "${r,,}" =~ ^s ]] && SNMP_TROCA_SENHA=sim
+  snmpd_de_outro && SNMPD_OUTRO=sim     # ANTES de instalar pacotes (o apt cria um snmpd.conf de fábrica)
+  if [[ "$SNMPD_OUTRO" == sim ]]; then
+    echo; aviso "$SNMPD_ARQ é de outro produto (não começa com \"# Gerado por baseline v\"): o baseline NÃO o altera nem pede senhas. Só o usuário SNMPv3 é conferido (sudo baseline-verify); estas respostas ficam no baseline.env e nas regras do UFW."
   else
-    SNMP_TROCA_SENHA=sim
-  fi
-  if [[ "$SNMP_TROCA_SENHA" == sim ]]; then
-    echo "  As senhas são as que você vai cadastrar no monitoramento (SHA-256 / AES). Não ficam gravadas em lugar nenhum."
-    ler_senha "Senha de AUTENTICAÇÃO"; AUTH=$SENHA
-    ler_senha "Senha de CRIPTOGRAFIA "; PRIV=$SENHA
-    unset SENHA
-    [[ "$AUTH" == "$PRIV" ]] && aviso "Senhas de autenticação e criptografia iguais — funciona, mas o recomendado é diferentes."
+    TEM_USM=$(grep -c '^usmUser' /var/lib/snmp/snmpd.conf 2>/dev/null); TEM_USM=${TEM_USM:-0}
+    if (( TEM_USM > 0 )) && [[ "$(p SNMP_USER)" == "$SNMP_USER" ]]; then
+      read -rp "  O usuário $SNMP_USER já existe. Trocar as senhas? (s/N): " r </dev/tty
+      [[ "${r,,}" =~ ^s ]] && SNMP_TROCA_SENHA=sim
+    else
+      SNMP_TROCA_SENHA=sim
+    fi
+    if [[ "$SNMP_TROCA_SENHA" == sim ]]; then
+      echo "  As senhas são as que você vai cadastrar no monitoramento (SHA-256 / AES). Não ficam gravadas em lugar nenhum."
+      ler_senha "Senha de AUTENTICAÇÃO"; AUTH=$SENHA
+      ler_senha "Senha de CRIPTOGRAFIA "; PRIV=$SENHA
+      unset SENHA
+      [[ "$AUTH" == "$PRIV" ]] && aviso "Senhas de autenticação e criptografia iguais — funciona, mas o recomendado é diferentes."
+    fi
   fi
 else
   SNMP_ORIGENS=""; SNMP_USER=""; SNMP_LOCATION=""; SNMP_CONTACT=""
@@ -1036,7 +1089,10 @@ echo "  UFW (entrada) ......: negar tudo, exceto:"
 echo "      SSH $SSH_PORT/tcp de: $GESTAO_SSH"
 [[ "$SNMP" == sim ]] && echo "      SNMP 161/udp de: $SNMP_ORIGENS"
 echo "      (estado atual do UFW: ${UFW_ANTES:-desconhecido}; regras de outros programas são mantidas)"
-if [[ "$SNMP" == sim ]]; then
+if [[ "$SNMP" == sim && "$SNMPD_OUTRO" == sim ]]; then
+  aviso "snmpd.conf de outro produto — mantido; só o usuário SNMPv3 é conferido"
+  echo "  SNMPv3 .............: usuário $SNMP_USER; $SNMPD_ARQ NÃO será alterado (porta 161 liberada no UFW para $SNMP_ORIGENS)"
+elif [[ "$SNMP" == sim ]]; then
   echo "  SNMPv3 .............: usuário $SNMP_USER (authPriv SHA-256/AES), escuta $V4 e 127.0.0.1"
   echo "                        senhas: $([[ $SNMP_TROCA_SENHA == sim ]] && echo 'novas' || echo 'mantidas')"
 fi
@@ -1266,37 +1322,34 @@ fi
 # =================================================================================================
 info "4/4 SNMPv3"
 if [[ "$SNMP" == sim ]]; then
-  cat > /etc/snmp/snmpd.conf <<EOF
-# Gerado por baseline v$VERSAO em $(date '+%F %T') — somente SNMPv3 (authPriv), leitura
-agentaddress udp:$V4:161,udp:127.0.0.1:161
-sysLocation "$SNMP_LOCATION"
-sysContact $SNMP_CONTACT
-rouser $SNMP_USER priv
-EOF
-  VAR=/var/lib/snmp/snmpd.conf
-  if [[ "$SNMP_TROCA_SENHA" == sim ]]; then
-    systemctl stop snmpd
-    if [[ ! -f "$VAR" ]]; then   # o snmpd (usuário Debian-snmp) precisa gravar aqui para converter o createUser
-      if getent passwd Debian-snmp >/dev/null; then install -o Debian-snmp -g Debian-snmp -m 600 /dev/null "$VAR"; else install -m 600 /dev/null "$VAR"; fi
+  if ! snmpd_gravar_conf; then
+    aviso "$SNMPD_ARQ de outro produto — mantido (não foi sobrescrito); só o usuário SNMPv3 é conferido: sudo baseline-verify"
+  else
+    VAR=/var/lib/snmp/snmpd.conf
+    if [[ "$SNMP_TROCA_SENHA" == sim ]]; then
+      systemctl stop snmpd
+      if [[ ! -f "$VAR" ]]; then   # o snmpd (usuário Debian-snmp) precisa gravar aqui para converter o createUser
+        if getent passwd Debian-snmp >/dev/null; then install -o Debian-snmp -g Debian-snmp -m 600 /dev/null "$VAR"; else install -m 600 /dev/null "$VAR"; fi
+      fi
+      sed -i '/^usmUser/d;/^createUser/d' "$VAR"
+      printf 'createUser %s SHA-256 "%s" AES "%s"\n' "$SNMP_USER" "$AUTH" "$PRIV" >> "$VAR"
     fi
-    sed -i '/^usmUser/d;/^createUser/d' "$VAR"
-    printf 'createUser %s SHA-256 "%s" AES "%s"\n' "$SNMP_USER" "$AUTH" "$PRIV" >> "$VAR"
+    systemctl enable snmpd >/dev/null 2>&1
+    systemctl restart snmpd && sleep 2
+    if [[ -n "$AUTH" ]]; then
+      # Teste real sem senha em argumento: snmp.conf temporário (0600) só para este snmpget
+      T=$(mktemp -d); TMPS+=("$T")
+      printf 'defVersion 3\ndefSecurityLevel authPriv\ndefSecurityName %s\ndefAuthType SHA-256\ndefAuthPassphrase %s\ndefPrivType AES\ndefPrivPassphrase %s\n' \
+        "$SNMP_USER" "$AUTH" "$PRIV" > "$T/snmp.conf"
+      if SNMPCONFPATH="$T" snmpget 127.0.0.1 1.3.6.1.2.1.1.3.0 >/dev/null 2>&1; then ok "snmpget SNMPv3 local respondeu"
+      else aviso "snmpget local NÃO respondeu — confira com: sudo baseline-verify"; fi
+      rm -rf "$T"
+    fi
+    unset AUTH PRIV
+    NC=$(grep -c '^createUser' "$VAR" 2>/dev/null); NU=$(grep -c '^usmUser' "$VAR" 2>/dev/null)
+    [[ "${NC:-0}" == 0 && "${NU:-0}" -ge 1 ]] && ok "Usuário $SNMP_USER ativo (createUser=${NC:-0} usmUser=${NU:-0})" \
+      || aviso "Contagem inesperada em $VAR: createUser=${NC:-0} usmUser=${NU:-0}"
   fi
-  systemctl enable snmpd >/dev/null 2>&1
-  systemctl restart snmpd && sleep 2
-  if [[ -n "$AUTH" ]]; then
-    # Teste real sem senha em argumento: snmp.conf temporário (0600) só para este snmpget
-    T=$(mktemp -d); TMPS+=("$T")
-    printf 'defVersion 3\ndefSecurityLevel authPriv\ndefSecurityName %s\ndefAuthType SHA-256\ndefAuthPassphrase %s\ndefPrivType AES\ndefPrivPassphrase %s\n' \
-      "$SNMP_USER" "$AUTH" "$PRIV" > "$T/snmp.conf"
-    if SNMPCONFPATH="$T" snmpget 127.0.0.1 1.3.6.1.2.1.1.3.0 >/dev/null 2>&1; then ok "snmpget SNMPv3 local respondeu"
-    else aviso "snmpget local NÃO respondeu — confira com: sudo baseline-verify"; fi
-    rm -rf "$T"
-  fi
-  unset AUTH PRIV
-  NC=$(grep -c '^createUser' "$VAR" 2>/dev/null); NU=$(grep -c '^usmUser' "$VAR" 2>/dev/null)
-  [[ "${NC:-0}" == 0 && "${NU:-0}" -ge 1 ]] && ok "Usuário $SNMP_USER ativo (createUser=${NC:-0} usmUser=${NU:-0})" \
-    || aviso "Contagem inesperada em $VAR: createUser=${NC:-0} usmUser=${NU:-0}"
 else
   ok "SNMP: não configurado"
 fi
