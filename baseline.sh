@@ -2,7 +2,8 @@
 # =============================================================================
 # baseline.sh — padrão inicial para servidores Ubuntu 24.04 LTS
 #
-#   1. Sistema: fuso horário, nome do servidor, atualização e atualização automática
+#   1. Sistema: disco (LVM), relógio, fuso horário, nome do servidor, atualização e atualização automática,
+#      atalhos de terminal (alias) e Ubuntu Pro (opcionais)
 #   2. IPv6 estático derivado do IPv4 (opcional)
 #   3. SSH: porta própria, só chave, sem root, AllowUsers/forwarding/timeouts + firewall UFW (com VOLTA AUTOMÁTICA)
 #   4. SNMPv3 somente leitura, authPriv (SHA-256/AES), sem community (opcional)
@@ -19,7 +20,7 @@
 # =============================================================================
 set -uo pipefail
 
-VERSAO="2.1.0"
+VERSAO="2.2.0"
 ENV_FILE=/root/baseline.env
 ENV_ANTIGO=/root/g2-baseline.env          # v1 (g2-baseline): lido como padrão, nunca alterado
 TS=$(date +%Y%m%d-%H%M%S)
@@ -40,9 +41,10 @@ ajuda() {
   cat <<'EOF'
 Arquivo de respostas: o mesmo formato de /root/baseline.env (CHAVE="valor", uma por linha).
 O /root/baseline.env de um servidor serve de modelo para o próximo (troque HOSTNAME_ e V6).
-Chaves: TZ_ HOSTNAME_ ATUALIZAR_AGORA HORA ATUALIZA_SEGURAR V6_ATIVAR V6_BLOCO V6_PREFIXO V6 V6_GW
+Chaves: TZ_ HOSTNAME_ ATUALIZAR_AGORA HORA ATUALIZA_SEGURAR DISCO_EXPANDIR ATALHOS PRO_ANEXAR V6_ATIVAR V6_BLOCO V6_PREFIXO V6 V6_GW
         ADMIN_USER PUBKEY SSH_PORT GESTAO_SSH SSH_USUARIOS SSH_TCP_FWD SSH_AGENT_FWD SSH_GRACE SSH_ALIVE_INT SSH_ALIVE_MAX
         SNMP SNMP_ORIGENS SNMP_USER SNMP_LOCATION SNMP_CONTACT
+O token do Ubuntu Pro NUNCA vai para arquivo de respostas: é sempre digitado (sem eco).
 EOF
 }
 
@@ -339,7 +341,7 @@ salvar_env() {
   {
     echo "# Gerado por baseline v$VERSAO em $(date '+%F %T') — SEM senhas. Serve de padrão para a próxima execução"
     echo "# e de modelo (--respostas) para outro servidor (troque HOSTNAME_ e V6)."
-    for k in BASELINE_VERSAO TZ_ HOSTNAME_ ATUALIZAR_AGORA HORA ATUALIZA_SEGURAR IF V4 V4_GW V6_ATIVAR V6_BLOCO V6_PREFIXO V6 V6_GW \
+    for k in BASELINE_VERSAO TZ_ HOSTNAME_ ATUALIZAR_AGORA HORA ATUALIZA_SEGURAR DISCO_EXPANDIR ATALHOS PRO_ANEXAR IF V4 V4_GW V6_ATIVAR V6_BLOCO V6_PREFIXO V6 V6_GW \
              ADMIN_USER PUBKEY_FPS SSH_PORT GESTAO_SSH SSH_USUARIOS SSH_TCP_FWD SSH_AGENT_FWD SSH_GRACE SSH_ALIVE_INT SSH_ALIVE_MAX \
              SNMP SNMP_ORIGENS SNMP_USER SNMP_LOCATION SNMP_CONTACT; do
       case $k in BASELINE_VERSAO) v=$VERSAO;; *) v=${!k:-};; esac
@@ -347,6 +349,130 @@ salvar_env() {
     done
   } > "$ENV_FILE"
   chmod 600 "$ENV_FILE"
+}
+
+# ---- Disco (LVM): o instalador deixa o LV da raiz menor que o disco --------------------------------
+# Define DISCO_LV, DISCO_VG, DISCO_LIVRE (bytes). Retorno 0 só se a raiz está num LV e o VG tem > 1 GB livre.
+disco_info() {
+  local src livre
+  DISCO_LV=""; DISCO_VG=""; DISCO_LIVRE=0
+  src=$(findmnt -no SOURCE / 2>/dev/null) || return 1
+  src=${src%%\[*}
+  [[ -n "$src" ]] || return 1
+  DISCO_VG=$(lvs --noheadings -o vg_name "$src" 2>/dev/null | tr -d '[:space:]') || return 1
+  [[ -n "$DISCO_VG" ]] || return 1
+  livre=$(vgs --noheadings --units b --nosuffix -o vg_free "$DISCO_VG" 2>/dev/null | tr -d '[:space:]') || return 1
+  livre=${livre%%.*}
+  [[ "$livre" =~ ^[0-9]+$ ]] || return 1
+  DISCO_LIVRE=$livre; DISCO_LV=$src
+  (( DISCO_LIVRE > 1073741824 ))
+}
+disco_gb() { awk -v b="$1" 'BEGIN{printf "%.1f", b/1073741824}'; }
+expandir_disco() { lvextend -r -l +100%FREE "$DISCO_LV"; }
+
+# ---- Relógio ----------------------------------------------------------------------------------
+relogio_sincronizado() { [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" == yes ]]; }
+relogio_servico() { # serviço de hora ativo (o baseline NÃO troca um pelo outro)
+  local u
+  for u in systemd-timesyncd chrony chronyd; do systemctl is-active --quiet "$u" 2>/dev/null && { echo "$u"; return 0; }; done
+  return 1
+}
+relogio_esperar() { # $1 = limite em s (60), $2 = passo em s (2); 0 = sincronizou
+  local lim=${1:-60} passo=${2:-2} t=0
+  while ! relogio_sincronizado; do (( t >= lim )) && return 1; sleep "$passo"; t=$((t+passo)); done
+  return 0
+}
+
+# ---- Atalhos de terminal (alias) em /etc/bash.bashrc, UM bloco marcado, reescrito por inteiro -------
+ATALHO_INI="# baseline: atalhos (início)"
+ATALHO_FIM="# baseline: atalhos (fim)"
+BASHRC_ARQ=/etc/bash.bashrc
+ATALHOS_LINHAS=""
+# "nome=comando nome2=comando com espaços": uma palavra nome= abre um atalho novo. Resultado em ATALHOS_LINHAS (uma "nome=comando" por linha).
+atalhos_parse() {
+  local -a w=(); local p c nome="" cmd="" vistos=" "
+  ATALHOS_LINHAS=""
+  [[ "$1" == *$'\n'* ]] && { echo "    use uma linha só"; return 1; }
+  for c in ';' '|' '&' '`' '$' '(' ')' '<' '>' '\' '"' "'"; do
+    [[ "$1" == *"$c"* ]] && { echo "    caractere não permitido no comando: $c   (proibidos: ; | & \` \$ ( ) < > \\ e aspas)"; return 1; }
+  done
+  read -ra w <<<"$1"
+  [[ ${#w[@]} -gt 0 ]] || return 1
+  for p in "${w[@]}" ""; do
+    if [[ -z "$p" || "$p" =~ ^[a-z][a-z0-9_-]*= ]]; then
+      if [[ -n "$nome" ]]; then
+        [[ -n "$cmd" ]] || { echo "    o atalho \"$nome\" está sem comando"; return 1; }
+        ATALHOS_LINHAS+="$nome=$cmd"$'\n'
+      fi
+      [[ -z "$p" ]] && break
+      nome=${p%%=*}; cmd=${p#*=}
+      [[ "$vistos" == *" $nome "* ]] && { echo "    o atalho \"$nome\" está repetido"; return 1; }
+      vistos+="$nome "
+    else
+      [[ -n "$nome" ]] || { echo "    \"$p\": use nome=comando (nome: [a-z][a-z0-9_-]*)"; return 1; }
+      cmd+="${cmd:+ }$p"
+    fi
+  done
+  [[ -n "$ATALHOS_LINHAS" ]]
+}
+val_atalhos() { # nenhum / - / n = sem atalhos (remove o bloco)
+  case "${1,,}" in nenhum|-|n|nao|não) VALOR=""; return 0;; esac
+  atalhos_parse "$1" || return 1
+  VALOR=${ATALHOS_LINHAS//$'\n'/ }; VALOR=${VALOR% }
+}
+atalhos_bloco() { # stdout = o bloco (nada se a lista é vazia)
+  local l
+  [[ -n "$1" ]] || return 0
+  atalhos_parse "$1" >/dev/null || return 1
+  printf '%s\n' "$ATALHO_INI"
+  while IFS= read -r l; do [[ -n "$l" ]] && printf "alias %s='%s'\n" "${l%%=*}" "${l#*=}"; done <<<"$ATALHOS_LINHAS"
+  printf '%s\n' "$ATALHO_FIM"
+}
+# gravar_atalhos LISTA [ARQUIVO]: tira o bloco antigo (e a linha em branco que o precede) e põe o novo no fim. Idempotente.
+# Nunca toca ~/.bashrc de usuário e nunca usa `source`.
+gravar_atalhos() {
+  local arq=${2:-$BASHRC_ARQ} t ni nf bloco
+  bloco=$(atalhos_bloco "$1") || return 1
+  [[ -f "$arq" ]] || : > "$arq"
+  ni=$(grep -cxF -- "$ATALHO_INI" "$arq"); nf=$(grep -cxF -- "$ATALHO_FIM" "$arq")
+  { [[ "$ni" == "$nf" ]] && (( ni <= 1 )); } || { echo "    marcadores de atalhos inconsistentes em $arq — nada foi alterado"; return 1; }
+  t=$(mktemp) || return 1
+  awk -v ini="$ATALHO_INI" -v fim="$ATALHO_FIM" '
+    dentro { if ($0 == fim) dentro = 0; next }
+    $0 == ini { dentro = 1; held = 0; next }
+    { if (held) { print ""; held = 0 }
+      if ($0 == "") { held = 1; next }
+      print }
+    END { if (held) print "" }' "$arq" > "$t"
+  if [[ -n "$bloco" ]]; then
+    [[ -s "$t" && -n "$(tail -c1 "$t")" ]] && echo >> "$t"
+    { echo; printf '%s\n' "$bloco"; } >> "$t"
+  fi
+  cat "$t" > "$arq"; rm -f "$t"
+}
+
+# ---- Ubuntu Pro: o token só existe em variável de shell, em arquivo 0600 temporário e na tela sem eco ------------
+val_token_pro() { [[ "$1" =~ ^[A-Za-z0-9_.=-]{8,256}$ ]]; }
+pro_anexado() { pro status --format json 2>/dev/null | python3 -I -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("attached") else 1)' 2>/dev/null; }
+ler_token_pro() { # resultado em PRO_TOKEN; vazio = desistiu
+  local t
+  PRO_TOKEN=""
+  while :; do
+    read -rsp "  Token do Ubuntu Pro (não aparece na tela; Enter vazio desiste): " t </dev/tty; echo
+    [[ -z "$t" ]] && return 1
+    val_token_pro "$t" && { PRO_TOKEN=$t; return 0; }
+    echo "    Formato inesperado (8 a 256 letras, números, . _ = -). Copie o token inteiro de https://ubuntu.com/pro"
+  done
+}
+# pro attach --attach-config ARQUIVO(0600 em pasta 0700, apagado no fim e no trap): o token NUNCA vai em argumento nem sai na saída
+anexar_pro() {
+  local d f l rc
+  d=$(mktemp -d) || return 1; TMPS+=("$d"); chmod 700 "$d"; f=$d/attach.yaml
+  ( umask 077; printf 'token: "%s"\n' "$PRO_TOKEN" > "$f" ); chmod 600 "$f"
+  pro attach --attach-config "$f" 2>&1 | while IFS= read -r l; do printf '%s\n' "${l//"$PRO_TOKEN"/***}"; done
+  rc=${PIPESTATUS[0]}
+  rm -rf -- "$d"; PRO_TOKEN=""
+  return "$rc"
 }
 
 # Permite `source baseline.sh` nos testes (tests/run.sh): só as funções, nada é executado
@@ -434,6 +560,30 @@ pergunta HORA "Horário da atualização automática diária (HH:MM)" \
 pergunta ATUALIZA_SEGURAR "Pacotes que a atualização automática NÃO deve tocar" \
 "Separe por espaço. Em servidor DNS use: unbound (reiniciar o unbound zera o cache; atualize-o pelo painel).
 Enter vazio = nenhum." "unbound" "$(p ATUALIZA_SEGURAR)" val_pacotes sim
+
+# Disco: o instalador do Ubuntu com LVM deixa o LV da raiz menor que o disco. Só pergunta se há > 1 GB livre no VG.
+DISCO_EXPANDIR=""
+if disco_info; then
+  pergunta DISCO_EXPANDIR "Usar todo o disco para o sistema?" \
+"O LV da raiz ($DISCO_LV) é menor que o disco: sobram $(disco_gb "$DISCO_LIVRE") GB livres no grupo $DISCO_VG.
+Sim: lvextend -r -l +100%FREE (cresce o LV e o sistema de arquivos, com o sistema ligado, sem reiniciar).
+Responda n se esse espaço for para outro LV ou snapshot — encolher depois é trabalhoso." "s" "$(p DISCO_EXPANDIR sim)" val_simnao
+fi
+
+# Relógio: DNSSEC e certificados dependem da hora certa. Só LÊ e espera; NÃO troca timesyncd por chrony.
+RELOGIO_SERVICO=$(relogio_servico || true); RELOGIO_AVISO=""
+if relogio_sincronizado; then RELOGIO_ESTADO="sincronizado"
+else
+  echo; echo "  Relógio ainda não sincronizado — aguardando até 60 s…"
+  if relogio_esperar 60 2; then RELOGIO_ESTADO="sincronizado"
+  else
+    RELOGIO_ESTADO="NÃO sincronizado"
+    RELOGIO_AVISO="DNSSEC e certificados dependem da hora certa. Confira o serviço de hora (systemctl status systemd-timesyncd ou chrony) e a saída UDP 123 para a internet."
+  fi
+fi
+if [[ -z "$RELOGIO_SERVICO" ]]; then
+  RELOGIO_AVISO="${RELOGIO_AVISO:+$RELOGIO_AVISO }Nenhum serviço de hora ativo (systemd-timesyncd nem chrony): o baseline NÃO escolhe um por você."
+fi
 
 info "IPv6"
 # Sugestão do /64, sem inventar: 1) prefixo anunciado pelo roteador (SLAAC); 2) vizinho da MESMA rede IPv4 com AAAA no DNS
@@ -585,6 +735,28 @@ o cliente responde sozinho. 0 desliga a verificação. Faixa 0–3600." "300" "$
 pergunta SSH_ALIVE_MAX "Falhas seguidas antes de derrubar (ClientAliveCountMax)" \
 "Com 300 s e 2 falhas, uma conexão morta cai em cerca de 10 min. Faixa 1–10." "2" "$(p SSH_ALIVE_MAX 2)" val_alive_max
 
+info "Atalhos de terminal e Ubuntu Pro"
+AT_PADRAO="r=reset"; [[ -n "${PADRAO[ATALHOS]+x}" ]] && AT_PADRAO=${PADRAO[ATALHOS]:-nenhum}
+pergunta ATALHOS "Atalhos de terminal (alias) para TODOS os usuários, inclusive root?" \
+"Gravados num bloco marcado em /etc/bash.bashrc (só shells interativos do bash); ~/.bashrc de usuário não é tocado.
+Formato: nome=comando, vários separados por espaço (o comando pode ter espaços). Nome: [a-z][a-z0-9_-]*.
+Proibidos no comando: ponto e vírgula, barra vertical, &, crase, $, parênteses, < >, barra invertida e aspas. 'nenhum' remove o bloco (e os atalhos)." \
+"r=reset ll=ls -la" "$AT_PADRAO" val_atalhos sim
+
+PRO_TOKEN=""; PRO_JA=nao
+command -v pro >/dev/null && pro_anexado && PRO_JA=sim
+if [[ "$PRO_JA" == sim ]]; then
+  PRO_ANEXAR=sim; echo; echo "  Ubuntu Pro: este servidor já está anexado — nada a fazer."
+else
+  pergunta PRO_ANEXAR "Anexar ao Ubuntu Pro (Livepatch, ESM)?" \
+"Livepatch aplica correções do kernel sem reiniciar; ESM estende as atualizações de segurança. Gratuito para uso pessoal
+e pequeno (token em https://ubuntu.com/pro). O token é digitado sem eco, passado ao 'pro attach' por arquivo temporário 0600
+e NUNCA vai para log, resumo, argumento de comando nem para o baseline.env." "s" "$(p PRO_ANEXAR nao)" val_simnao
+  if [[ "$PRO_ANEXAR" == sim ]]; then
+    ler_token_pro || { aviso "Sem token: Ubuntu Pro não será anexado."; PRO_ANEXAR=nao; }
+  fi
+fi
+
 info "SNMP"
 pergunta SNMP "Configurar SNMPv3 (monitoramento, ex.: PRTG, Zabbix, LibreNMS)?" "Somente leitura, com usuário e duas senhas; sem community v1/v2c." "s" "$(p SNMP sim)" val_simnao
 AUTH=""; PRIV=""; SNMP_TROCA_SENHA=nao
@@ -624,6 +796,16 @@ echo "  Fuso / nome ........: $TZ_ / $HOSTNAME_"
 echo "  Atualizar agora ....: $ATUALIZAR_AGORA"
 echo "  Atualização auto ...: todo dia às $HORA (só segurança, sem reboot automático)"
 echo "  Fora da auto .......: ${ATUALIZA_SEGURAR:-(nenhum)}"
+if [[ "$DISCO_EXPANDIR" == sim ]]; then echo "  Disco ..............: expandir $DISCO_LV com +$(disco_gb "$DISCO_LIVRE") GB livres do grupo $DISCO_VG (lvextend -r -l +100%FREE)"
+elif [[ "$DISCO_EXPANDIR" == nao ]]; then echo "  Disco ..............: NÃO expandir ($(disco_gb "$DISCO_LIVRE") GB livres no grupo $DISCO_VG ficam sem uso)"
+else echo "  Disco ..............: nada a fazer (sem LVM na raiz ou sem espaço livre no grupo)"; fi
+echo "  Relógio ............: $RELOGIO_ESTADO (serviço: ${RELOGIO_SERVICO:-nenhum ativo})"
+[[ -n "$RELOGIO_AVISO" ]] && aviso "Relógio: $RELOGIO_AVISO"
+if [[ -n "$ATALHOS" ]]; then echo "  Atalhos de terminal : $ATALHOS   (todos os usuários, em $BASHRC_ARQ)"
+else echo "  Atalhos de terminal : nenhum (o bloco do baseline, se existir, será removido)"; fi
+if [[ "$PRO_JA" == sim ]]; then echo "  Ubuntu Pro .........: já anexado (nada a fazer)"
+elif [[ "$PRO_ANEXAR" == sim ]]; then echo "  Ubuntu Pro .........: anexar: sim (token recebido; não é gravado em lugar nenhum)"
+else echo "  Ubuntu Pro .........: anexar: não"; fi
 if [[ -n "$V6" ]]; then echo "  IPv6 ...............: $V6/64  gateway $V6_GW  ($IF)${V6_BLOCO:+  bloco $V6_BLOCO}"; echo "                        teste: $V6_TESTE"; else echo "  IPv6 ...............: não configurar"; fi
 echo "  SSH ................: porta $SSH_PORT, só chave, sem root, administrador $ADMIN_USER"
 echo "  SSH AllowUsers .....: $SSH_USUARIOS"
@@ -654,11 +836,16 @@ cp -a /etc/netplan "$BK/netplan" 2>/dev/null
 cp -a /etc/ufw "$BK/ufw" 2>/dev/null
 cp -a /etc/snmp/snmpd.conf "$BK/" 2>/dev/null
 cp -a /etc/hosts /etc/hostname "$BK/" 2>/dev/null
+cp -a "$BASHRC_ARQ" "$BK/bash.bashrc" 2>/dev/null
 
 # =================================================================================================
 # 1. SISTEMA
 # =================================================================================================
 info "1/4 Sistema"
+if [[ "$DISCO_EXPANDIR" == sim ]]; then
+  if expandir_disco; then ok "Disco: $DISCO_LV expandido (+100%FREE do grupo $DISCO_VG)"
+  else aviso "lvextend falhou — o disco não foi expandido (nada mais foi alterado por isso). Faça à mão: lvextend -r -l +100%FREE $DISCO_LV"; fi
+fi
 timedatectl set-timezone "$TZ_" && ok "Fuso $TZ_"
 if [[ "$(hostname)" != "$HOSTNAME_" ]]; then
   hostnamectl set-hostname "$HOSTNAME_" || pare "hostnamectl falhou"
@@ -677,6 +864,7 @@ if [[ "$ATUALIZAR_AGORA" == sim ]]; then
 fi
 PKGS=(unattended-upgrades ufw openssh-client)
 [[ "$SNMP" == sim ]] && PKGS+=(snmpd snmp)
+[[ "$PRO_ANEXAR" == sim && "$PRO_JA" != sim ]] && PKGS+=(ubuntu-pro-client)
 apt-get "${APT_OPTS[@]}" install "${PKGS[@]}" >/dev/null || pare "Instalação de pacotes falhou"
 ok "Pacotes: ${PKGS[*]}"
 cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
@@ -696,6 +884,12 @@ printf '[Timer]\nOnCalendar=\nOnCalendar=*-*-* %s\nRandomizedDelaySec=0\n' "$HOR
 chmod 644 /etc/systemd/system/apt-daily-upgrade.timer.d/override.conf
 systemctl daemon-reload && systemctl enable apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 \
   && systemctl restart apt-daily.timer apt-daily-upgrade.timer && ok "Atualização automática às $HORA${ATUALIZA_SEGURAR:+ (fora: $ATUALIZA_SEGURAR)}"
+
+if gravar_atalhos "$ATALHOS"; then ok "Atalhos de terminal: ${ATALHOS:-nenhum (bloco removido)}"
+else aviso "Atalhos não gravados em $BASHRC_ARQ (veja a mensagem acima)"; fi
+if [[ "$PRO_JA" != sim && "$PRO_ANEXAR" == sim ]]; then
+  if anexar_pro; then ok "Ubuntu Pro anexado"; else aviso "pro attach falhou — confira o token em https://ubuntu.com/pro e rode: sudo pro attach (o baseline-verify avisa)"; fi
+fi
 
 # =================================================================================================
 # 2. IPv6

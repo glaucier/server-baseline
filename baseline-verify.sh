@@ -24,6 +24,7 @@ avs() { # avs "descrição" comando...  (não reprova: só chama atenção)
 }
 sec() { echo -e "\n\e[36m== $* ==\e[0m"; }
 igual() { [[ "$1" == "$2" ]]; }
+inf() { echo -e "  \e[36m[INFO]\e[0m  $*"; }
 sim_yn() { [[ "$1" == sim ]] && echo yes || echo no; }
 
 # SSH efetivo (saída do `sshd -T -C user=…`, que respeita Match) contra o que o baseline registrou.
@@ -47,6 +48,82 @@ confere_ssh_efetivo() { # $1 = saída do sshd -T
     efet=$(awk '$1=="allowusers"{print $2}' <<<"$T" | sort | tr '\n' ' ')
     chk "sshd efetivo: allowusers = $(e SSH_USUARIOS) (sem usuário a mais nem a menos; efetivo: ${efet:-nenhum})" igual "$efet" "$esp"
   fi
+}
+
+# --- Atalhos de terminal: CÓPIAS EXATAS de baseline.sh (tests/run.sh confere que são idênticas) ---
+ATALHO_INI="# baseline: atalhos (início)"
+ATALHO_FIM="# baseline: atalhos (fim)"
+BASHRC_ARQ=/etc/bash.bashrc
+ATALHOS_LINHAS=""
+# "nome=comando nome2=comando com espaços" -> ATALHOS_LINHAS
+atalhos_parse() {
+  local -a w=(); local p c nome="" cmd="" vistos=" "
+  ATALHOS_LINHAS=""
+  [[ "$1" == *$'\n'* ]] && { echo "    use uma linha só"; return 1; }
+  for c in ';' '|' '&' '`' '$' '(' ')' '<' '>' '\' '"' "'"; do
+    [[ "$1" == *"$c"* ]] && { echo "    caractere não permitido no comando: $c   (proibidos: ; | & \` \$ ( ) < > \\ e aspas)"; return 1; }
+  done
+  read -ra w <<<"$1"
+  [[ ${#w[@]} -gt 0 ]] || return 1
+  for p in "${w[@]}" ""; do
+    if [[ -z "$p" || "$p" =~ ^[a-z][a-z0-9_-]*= ]]; then
+      if [[ -n "$nome" ]]; then
+        [[ -n "$cmd" ]] || { echo "    o atalho \"$nome\" está sem comando"; return 1; }
+        ATALHOS_LINHAS+="$nome=$cmd"$'\n'
+      fi
+      [[ -z "$p" ]] && break
+      nome=${p%%=*}; cmd=${p#*=}
+      [[ "$vistos" == *" $nome "* ]] && { echo "    o atalho \"$nome\" está repetido"; return 1; }
+      vistos+="$nome "
+    else
+      [[ -n "$nome" ]] || { echo "    \"$p\": use nome=comando (nome: [a-z][a-z0-9_-]*)"; return 1; }
+      cmd+="${cmd:+ }$p"
+    fi
+  done
+  [[ -n "$ATALHOS_LINHAS" ]]
+}
+# stdout = o bloco esperado (nada se a lista é vazia)
+atalhos_bloco() { # stdout = o bloco (nada se a lista é vazia)
+  local l
+  [[ -n "$1" ]] || return 0
+  atalhos_parse "$1" >/dev/null || return 1
+  printf '%s\n' "$ATALHO_INI"
+  while IFS= read -r l; do [[ -n "$l" ]] && printf "alias %s='%s'\n" "${l%%=*}" "${l#*=}"; done <<<"$ATALHOS_LINHAS"
+  printf '%s\n' "$ATALHO_FIM"
+}
+# O bloco que está de fato no arquivo $1 (do marcador de início ao de fim)
+atalhos_bloco_atual() { awk -v ini="$ATALHO_INI" -v fim="$ATALHO_FIM" '$0 == ini { d = 1 } d { print } $0 == fim { d = 0 }' "$1"; }
+# Alias efetivo: `bash -ic 'alias NOME'` como root e como o administrador
+alias_efetivo() { # $1 = nome, $2 = "root" | usuário
+  if [[ "$2" == root ]]; then HOME=/root bash -ic "alias $1" 2>/dev/null
+  else runuser -l "$2" -c "bash -ic 'alias $1'" 2>/dev/null; fi
+}
+
+# --- Disco e relógio ---
+# "VG livre_em_bytes" do grupo do LV da raiz; falha se a raiz não está em LVM
+vg_raiz_livre() {
+  local src vg livre
+  src=$(findmnt -no SOURCE / 2>/dev/null) || return 1
+  src=${src%%\[*}
+  vg=$(lvs --noheadings -o vg_name "$src" 2>/dev/null | tr -d '[:space:]'); [[ -n "$vg" ]] || return 1
+  livre=$(vgs --noheadings --units b --nosuffix -o vg_free "$vg" 2>/dev/null | tr -d '[:space:]'); livre=${livre%%.*}
+  [[ "$livre" =~ ^[0-9]+$ ]] || return 1
+  echo "$vg $livre"
+}
+relogio_sincronizado() { [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" == yes ]]; }
+relogio_servico() {
+  local u
+  for u in systemd-timesyncd chrony chronyd; do systemctl is-active --quiet "$u" 2>/dev/null && { echo "$u"; return 0; }; done
+  return 1
+}
+# Ubuntu Pro: "sim <serviços habilitados>" ou "nao"
+pro_estado() {
+  local j
+  command -v pro >/dev/null || { echo ausente; return 0; }
+  j=$(pro status --format json 2>/dev/null) || { echo nao; return 0; }
+  python3 -I -c 'import json,sys
+d = json.load(sys.stdin)
+print("sim " + " ".join(s["name"] for s in d.get("services", []) if s.get("status") == "enabled") if d.get("attached") else "nao")' <<<"$j" 2>/dev/null || echo nao
 }
 
 # Permissão: dono root e nenhum bit de grupo/outros. $1 = arquivo ou pasta
@@ -85,6 +162,50 @@ for pk in $(e ATUALIZA_SEGURAR); do
   chk "$pk fora da atualização automática"            grep -q "\"$pk\";" /etc/apt/apt.conf.d/52baseline
 done
 avs "Sem reinício pendente"                           test ! -f /var/run/reboot-required
+
+sec "Disco, relógio, atalhos e Ubuntu Pro"
+if R=$(vg_raiz_livre); then
+  VGN=${R% *}; VGL=${R#* }
+  if (( VGL > 1073741824 )); then
+    GBL=$(awk -v b="$VGL" 'BEGIN{printf "%.1f", b/1073741824}')
+    ESC=""; [[ "$(e DISCO_EXPANDIR)" == nao ]] && ESC=" — você escolheu não expandir"
+    echo -e "  \e[33m[AVISO]\e[0m Sobram $GBL GB livres no grupo $VGN da raiz (rode o baseline de novo e responda s em \"Usar todo o disco\", ou: lvextend -r -l +100%FREE <lv da raiz>)$ESC"
+    AVISO=$((AVISO+1))
+  else
+    echo -e "  \e[32m[OK]\e[0m    Disco: ≤ 1 GB livre no grupo $VGN (LV da raiz ocupa o disco)"; PASS=$((PASS+1))
+  fi
+else
+  inf "Disco: a raiz não está em LVM — nada a conferir"
+fi
+chk "Relógio sincronizado (NTPSynchronized=yes) — DNSSEC e certificados dependem da hora certa"  relogio_sincronizado
+chk "Serviço de hora ativo ($(relogio_servico || echo 'nenhum: systemd-timesyncd ou chrony'))"   relogio_servico
+if [[ -z "${E[ATALHOS]+x}" ]]; then
+  avs "Atalhos de terminal (não registrado: baseline anterior à v2.2.0 — rode o baseline de novo)" false
+else
+  ESP_B=$(atalhos_bloco "$(e ATALHOS)")
+  if [[ -z "$(e ATALHOS)" ]]; then
+    chk "Sem bloco de atalhos em $BASHRC_ARQ (nenhum atalho escolhido)"   bash -c "! grep -qxF -- '$ATALHO_INI' '$BASHRC_ARQ'"
+  else
+    chk "Bloco de atalhos em $BASHRC_ARQ igual ao baseline.env"           igual "$(atalhos_bloco_atual "$BASHRC_ARQ")" "$ESP_B"
+    chk "Um único bloco de atalhos"                                         bash -c "[[ \$(grep -cxF -- '$ATALHO_INI' '$BASHRC_ARQ') == 1 ]]"
+    atalhos_parse "$(e ATALHOS)" >/dev/null
+    while IFS= read -r al; do
+      [[ -n "$al" ]] || continue
+      for who in root "$ADMIN_USER"; do
+        chk "Atalho '${al%%=*}' ativo para $who (bash -ic)"                igual "$(alias_efetivo "${al%%=*}" "$who")" "alias ${al%%=*}='${al#*=}'"
+      done
+    done <<<"$ATALHOS_LINHAS"
+  fi
+fi
+PRO_E=$(pro_estado)
+case "$PRO_E" in
+  sim*) inf "Ubuntu Pro: anexado; serviços habilitados: ${PRO_E#sim }" ;;
+  ausente) inf "Ubuntu Pro: comando 'pro' ausente" ;;
+  *) inf "Ubuntu Pro: não anexado" ;;
+esac
+if [[ "$(e PRO_ANEXAR)" == sim && "$PRO_E" != sim* ]]; then
+  echo -e "  \e[33m[AVISO]\e[0m Ubuntu Pro foi pedido no baseline mas NÃO está anexado (sudo pro attach — token em https://ubuntu.com/pro)"; AVISO=$((AVISO+1))
+fi
 
 sec "Confirmação do baseline"
 PEND=$(compgen -G '/root/baseline-backup-*/PENDENTE' || true)
