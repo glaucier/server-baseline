@@ -4,6 +4,18 @@ Formato: versão, data, o que mudou. Mudanças nas chaves do `/root/baseline.env
 "Contrato do baseline.env" no README) aparecem sempre na subseção **Contrato do baseline.env**: **renomear, remover ou
 mudar o formato de uma chave do contrato exige aviso aqui, na mesma versão.**
 
+## 2.2.1 — 2026-11-06
+
+### Corrigido
+- **`volta.sh` restaura SÓ o que o próprio baseline grava.** Antes ele copiava de volta o diretório `sshd_config.d` e o `/etc/ufw` inteiros: um arquivo/regra de outro produto alterado (ou removido) dentro da janela de 5 min seria revertido (ou ressuscitado). Agora:
+  - SSH: apaga o `10-baseline.conf` novo e devolve o de antes (se havia) e o arquivo da v1 que o baseline moveu; nunca toca em outros arquivos de `sshd_config.d`;
+  - UFW: apaga as regras marcadas `# baseline:`, recoloca as de antes (lidas do `ufw status` antes de mexer, só no formato exato do baseline), devolve as políticas padrão e ativo/inativo; regras de outros produtos ficam como estão;
+  - SNMP: restaura o `snmpd.conf` do backup **só se** o que está lá foi gerado pelo baseline.
+- `tests/volta.sh` (36 verificações): um `01-outro.conf` alterado dentro da janela continua como estava depois da volta; arquivo criado/removido por outro produto idem; regras UFW de outros produtos idem.
+
+### Contrato do baseline.env
+- Nenhuma chave alterada.
+
 ## 2.2.0 — 2026-11-06
 
 Achados da simulação "como cliente" do DNS Admin (VM Ubuntu 24.04 limpa).

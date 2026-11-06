@@ -22,7 +22,7 @@ no_verify()   { local c=$1; shift; CODIGO=$c bash -c 'set -uo pipefail; source "
 sec "Sintaxe e política"
 t "bash -n baseline.sh"        bash -n baseline.sh
 t "bash -n baseline-verify.sh" bash -n baseline-verify.sh
-t "versão 2.2.0 no baseline.sh"  grep -q '^VERSAO="2.2.0"' baseline.sh
+t "versão 2.2.1 no baseline.sh"  grep -q '^VERSAO="2.2.1"' baseline.sh
 t "nunca \`source\` de arquivo de respostas/env (só leitura chave=valor)" bash -c '! grep -nE "^[[:space:]]*(source|\.)[[:space:]]+(\"?\$(ARQ_RESP|ENV_FILE|ENV_ANTIGO)|/root/)" baseline.sh baseline-verify.sh'
 t "log nasce 600 (install) ANTES do exec/tee" bash -c '
   a=$(grep -n "install -m 600 -o root -g root /dev/null \"\$LOG\"" baseline.sh | head -1 | cut -d: -f1)
@@ -105,7 +105,7 @@ t "so_root: 644 é recusado"          bash -c 'source "$1"; ! so_root "$2"' _ "$
 
 sec "/root/baseline.env: sem senha, 600, chaves novas"
 t "salvar_env grava as chaves novas, nenhuma senha, modo 600" no_baseline "
-  ENV_FILE=\"$TMP/b.env\"; VERSAO=2.2.0; $PREPARA; AUTH='SenhaAuth123'; PRIV='SenhaPriv456'; SENHA='SenhaX789'; PRO_TOKEN='TokenPro1234567890'; DISCO_EXPANDIR=sim; ATALHOS='r=reset'; PRO_ANEXAR=sim; SNMP_USER=u; salvar_env
+  ENV_FILE=\"$TMP/b.env\"; VERSAO=2.2.1; $PREPARA; AUTH='SenhaAuth123'; PRIV='SenhaPriv456'; SENHA='SenhaX789'; PRO_TOKEN='TokenPro1234567890'; DISCO_EXPANDIR=sim; ATALHOS='r=reset'; PRO_ANEXAR=sim; SNMP_USER=u; salvar_env
   [[ \$(stat -c %a \"\$ENV_FILE\") == 600 ]] && grep -qx 'SSH_USUARIOS=\"admin backup\"' \"\$ENV_FILE\" && grep -qx 'SSH_TCP_FWD=\"nao\"' \"\$ENV_FILE\" &&
   grep -qx 'SSH_AGENT_FWD=\"nao\"' \"\$ENV_FILE\" && grep -qx 'SSH_GRACE=\"30\"' \"\$ENV_FILE\" && grep -qx 'SSH_ALIVE_INT=\"300\"' \"\$ENV_FILE\" && grep -qx 'SSH_ALIVE_MAX=\"2\"' \"\$ENV_FILE\" &&
   ! grep -qE 'SenhaAuth123|SenhaPriv456|SenhaX789|TokenPro1234567890|AUTH|PRIV|SENHA|TOKEN' \"\$ENV_FILE\" && grep -qx 'DISCO_EXPANDIR=\"sim\"' \"\$ENV_FILE\" && grep -qx 'ATALHOS=\"r=reset\"' \"\$ENV_FILE\" && grep -qx 'PRO_ANEXAR=\"sim\"' \"\$ENV_FILE\""
@@ -302,9 +302,9 @@ t "arquivo de respostas: PRO_ANEXAR=sim entra; token NÃO é chave do arquivo" n
 
 sec "Contrato do baseline.env (chaves que outros produtos leem)"
 CONTRATO="BASELINE_VERSAO ADMIN_USER SSH_PORT GESTAO_SSH SSH_USUARIOS SNMP SNMP_ORIGENS SNMP_USER SNMP_LOCATION SNMP_CONTACT"
-t "salvar_env grava todas as chaves do contrato"         no_baseline "ENV_FILE=\"$TMP/c.env\"; VERSAO=2.2.0; salvar_env; for k in $CONTRATO; do grep -q \"^\${k}=\" \"\$ENV_FILE\" || { echo \"falta \$k\"; exit 1; }; done"
+t "salvar_env grava todas as chaves do contrato"         no_baseline "ENV_FILE=\"$TMP/c.env\"; VERSAO=2.2.1; salvar_env; for k in $CONTRATO; do grep -q \"^\${k}=\" \"\$ENV_FILE\" || { echo \"falta \$k\"; exit 1; }; done"
 t "README documenta cada chave do contrato"              bash -c 'sed -n "/Contrato do baseline.env/,\$p" README.md > "$2"; for k in $1; do grep -q "\`$k\`" "$2" || { echo "README sem $k"; exit 1; }; done' _ "$CONTRATO" "$TMP/contrato.md"
-t "CHANGELOG.md existe e registra a 2.2.0"                bash -c 'grep -q "2.2.0" CHANGELOG.md && grep -qi "renomear\|renomeada\|renomeação" CHANGELOG.md'
+t "CHANGELOG.md existe e registra a 2.2.1"                bash -c 'grep -q "2.2.1" CHANGELOG.md && grep -qi "renomear\|renomeada\|renomeação" CHANGELOG.md'
 t "nenhum rename silencioso: chaves do contrato continuam no código" bash -c 'for k in SSH_PORT GESTAO_SSH SSH_USUARIOS SNMP_ORIGENS SNMP_USER SNMP_LOCATION SNMP_CONTACT; do grep -q "\b$k\b" baseline.sh || exit 1; done'
 
 
@@ -472,7 +472,7 @@ fi
 sec "2) Abortado: a versão nova do verify; o verify imprime a PRÓPRIA versão"
 t "pare: aponta para o baseline-verify.sh ao lado do script"  bash -c 'out=$(source ./baseline.sh; LOG=/x; pare "teste" 2>&1); rc=$?; [[ $rc -ne 0 && "$out" == *"Abortado."* && "$out" == *"Para conferir com a versão nova: sudo bash '"$RAIZ"'/baseline-verify.sh"* ]]'
 mkdir -p "$TMP/sozinho"; cp baseline.sh "$TMP/sozinho/"
-t "pare: sem baseline-verify.sh ao lado, manda baixar o da mesma versão" bash -c 'out=$(source "$1"; LOG=/x; pare "teste" 2>&1); [[ "$out" == *"baixe o baseline-verify.sh da v2.2.0"* && "$out" == *"o '"'"'sudo baseline-verify'"'"' instalado pode ser o da versão anterior"* ]]' _ "$TMP/sozinho/baseline.sh"
+t "pare: sem baseline-verify.sh ao lado, manda baixar o da mesma versão" bash -c 'out=$(source "$1"; LOG=/x; pare "teste" 2>&1); [[ "$out" == *"baixe o baseline-verify.sh da v2.2.1"* && "$out" == *"o '"'"'sudo baseline-verify'"'"' instalado pode ser o da versão anterior"* ]]' _ "$TMP/sozinho/baseline.sh"
 t "toda mensagem 'Abortado' sai pelo pare (um único lugar)"      bash -c '[[ $(grep -c "Abortado" baseline.sh) == 1 ]] && grep -n "Abortado" baseline.sh | grep -q "echo \"Abortado. Log"'
 t "conflito de SSH e autoteste abortam via pare"                  bash -c 'grep -q "pare \"Nada foi alterado (conflito de SSH" baseline.sh && grep -q "pare \"Autoteste do SSH falhou" baseline.sh'
 t "verify imprime a SUA versão e a de quem aplicou o padrão"      bash -c 'source ./baseline-verify.sh; declare -A E=([BASELINE_VERSAO]=2.1.0); out=$(verify_cabecalho); [[ "$out" == *"baseline-verify v$VERIFY_VERSAO "* && "$out" == *"padrão aplicado pela v2.1.0"* ]]'
@@ -517,7 +517,7 @@ t "snmpd_de_outro: conffile do pacote MODIFICADO (md5 diferente) → é de outro
 
 cp "$TMP/snmpd.outro" "$TMP/snmpd.intocado"
 t "baseline.sh NÃO sobrescreve o snmpd.conf de outro produto (conteúdo idêntico, retorno 1)" no_baseline 'SNMPD_ARQ=$1; SNMPD_OUTRO=sim; V4=1.2.3.4; SNMP_LOCATION=X; SNMP_CONTACT=y; SNMP_USER=u; ! snmpd_gravar_conf && cmp -s "$1" "$2"' "$TMP/snmpd.intocado" "$TMP/snmpd.outro"
-t "...e grava o do baseline (com a marca) quando não é de outro"   no_baseline 'SNMPD_ARQ=$1; SNMPD_OUTRO=nao; V4=1.2.3.4; SNMP_LOCATION=Sala; SNMP_CONTACT=y; SNMP_USER=monitorv3; snmpd_gravar_conf && head -1 "$1" | grep -q "^# Gerado por baseline v2.2.0" && grep -qx "rouser monitorv3 priv" "$1"' "$TMP/snmpd.novo"
+t "...e grava o do baseline (com a marca) quando não é de outro"   no_baseline 'SNMPD_ARQ=$1; SNMPD_OUTRO=nao; V4=1.2.3.4; SNMP_LOCATION=Sala; SNMP_CONTACT=y; SNMP_USER=monitorv3; snmpd_gravar_conf && head -1 "$1" | grep -q "^# Gerado por baseline v2.2.1" && grep -qx "rouser monitorv3 priv" "$1"' "$TMP/snmpd.novo"
 t "resumo: 'snmpd.conf de outro produto — mantido; só o usuário SNMPv3 é conferido'" bash -c 'sed -n "/RESUMO — nada foi alterado/,/read -rp \"Aplicar/p" baseline.sh | grep -q "snmpd.conf de outro produto — mantido; só o usuário SNMPv3 é conferido"'
 t "com snmpd.conf de outro produto o baseline NÃO pede as senhas"  bash -c '
   a=$(grep -n "if \[\[ \"\$SNMPD_OUTRO\" == sim \]\]; then" baseline.sh | head -1 | cut -d: -f1)
@@ -605,10 +605,14 @@ t "(a) nunca o conteúdo digitado"                                  bash -c '! g
 t "(a) Enter vazio pula: '(digitado: 0 caracteres)'"               bash -c 'source "$1"; printf "\n" | { ler_oculto "Senha: " A; } 2>&1 >/dev/null | grep -qx "  (digitado: 0 caracteres)"' _ "$RAIZ/baseline-verify.sh"
 t "(a) o verify usa ler_oculto para as duas senhas e o teste nos dois endereços" bash -c 'grep -q "ler_oculto \"Senha de AUTENTICAÇÃO (Enter pula): \" A" baseline-verify.sh && grep -q "ler_oculto \"Senha de CRIPTOGRAFIA: \" P" baseline-verify.sh && grep -q "snmp_confere_real \"\$SU\" \"\$A\" \"\$P\" \"\$V4\"" baseline-verify.sh'
 
+sec "volta.sh: restaura SÓ o que o baseline grava (tests/volta.sh)"
+N=$((N+1))
+if bash tests/volta.sh; then echo "  ok    volta.sh restaura só os arquivos/regras do baseline"; else echo "  FALHA volta.sh"; FALHAS=$((FALHAS+1)); fi
+
 sec "Versão marcada: SHA256SUMS"
 t "SHA256SUMS confere com os scripts (regenere: sha256sum baseline.sh baseline-verify.sh > SHA256SUMS)" sha256sum -c --quiet SHA256SUMS
-t "texto da release traz os dois sha256" bash -c 'for f in baseline.sh baseline-verify.sh; do h=$(sha256sum "$f" | cut -d" " -f1); grep -q "$h" docs/release-v2.2.0.md || exit 1; done'
-t "README aponta para v2.2.0" bash -c 'grep -q "v2.2.0/baseline.sh" README.md && ! grep -q "v2.1.0/baseline" README.md'
+t "texto da release traz os dois sha256" bash -c 'for f in baseline.sh baseline-verify.sh; do h=$(sha256sum "$f" | cut -d" " -f1); grep -q "$h" docs/release-v2.2.1.md || exit 1; done'
+t "README aponta para v2.2.1" bash -c 'grep -q "v2.2.1/baseline.sh" README.md && ! grep -q "v2.2.0/baseline" README.md'
 
 sec "sshd real (tests/integracao.sh)"
 if command -v sshd >/dev/null 2>&1 && command -v ssh >/dev/null 2>&1; then
