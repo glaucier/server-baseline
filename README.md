@@ -13,7 +13,7 @@ portas no UFW; o baseline só mexe nas regras marcadas `# baseline:`.
 |---|---|
 | 1. Sistema | **disco**: se o LV da raiz (LVM) é menor que o disco e sobra > 1 GB no grupo, oferece `lvextend -r -l +100%FREE`; **relógio**: confere `NTPSynchronized` e o serviço de hora (timesyncd ou chrony, **sem trocar um pelo outro**), esperando até 60 s; fuso horário, nome do servidor, `apt full-upgrade` (opcional), atualização automática diária **só de segurança, sem reboot automático**, no horário escolhido, com lista de pacotes que ela não toca (ex.: `unbound`); **atalhos de terminal** (alias) para todos os usuários (opcional); **Ubuntu Pro** (Livepatch/ESM, opcional) |
 | 2. IPv6 | sugere o /64 sozinho (prefixo anunciado pelo roteador, ou o AAAA de um vizinho da mesma rede IPv4 — ex.: o servidor DNS configurado), confere com o bloco do provedor, sugere `<prefixo>::<último octeto>` e **testa antes do resumo**: duplicidade (DAD) e resposta do gateway. Grava `/etc/netplan/60-ipv6.yaml` e já ativa, sem reboot |
-| 3. SSH + UFW | porta própria, só chave, sem root; **AllowUsers** (padrão: só o administrador), **AllowTcpForwarding no**, **AllowAgentForwarding no**, `LoginGraceTime 30`, `ClientAliveInterval 300`, `ClientAliveCountMax 2` (cada um é perguntado); UFW nega a entrada e libera o SSH só para as redes de gestão. **Volta automática**: se o novo acesso não for confirmado em 5 minutos, SSH e UFW voltam ao que eram |
+| 3. SSH + UFW | porta própria, só chave, sem root; **AllowUsers** (padrão: só o administrador), **AllowTcpForwarding no**, **AllowAgentForwarding no**, `LoginGraceTime 30`, `ClientAliveInterval 300`, `ClientAliveCountMax 2` (cada um é perguntado); UFW nega a entrada e libera o SSH só para as redes de gestão. **Volta automática**: se o novo acesso não for confirmado em 5 minutos, o baseline desfaz **só o que gravou** (SSH e UFW voltam ao que eram; arquivos e regras de outros produtos não são tocados) |
 | 4. SNMPv3 | somente leitura, `authPriv` (SHA-256/AES), sem community; porta 161 só para o monitoramento |
 
 As respostas (sem senha) ficam em `/root/baseline.env` e viram o padrão da próxima execução.
@@ -32,9 +32,9 @@ No servidor, baixe uma **versão marcada** (nunca a `main`), confira o SHA256 pu
 
 ```bash
 cd /tmp
-curl -fsSLO https://raw.githubusercontent.com/glaucier/server-baseline/v2.2.0/baseline.sh
-curl -fsSLO https://raw.githubusercontent.com/glaucier/server-baseline/v2.2.0/baseline-verify.sh
-curl -fsSLO https://raw.githubusercontent.com/glaucier/server-baseline/v2.2.0/SHA256SUMS
+curl -fsSLO https://raw.githubusercontent.com/glaucier/server-baseline/v2.2.1/baseline.sh
+curl -fsSLO https://raw.githubusercontent.com/glaucier/server-baseline/v2.2.1/baseline-verify.sh
+curl -fsSLO https://raw.githubusercontent.com/glaucier/server-baseline/v2.2.1/SHA256SUMS
 sha256sum -c SHA256SUMS                       # os dois têm de dar "OK"; compare também com a página da versão (Releases)
 sudo bash baseline.sh
 ```
@@ -52,6 +52,10 @@ vindo de um IP que **não** seja o loopback; sem isso o script avisa e exige um 
 A volta automática é um timer **temporário** do systemd (`systemd-run`, vive em `/run`): um **reboot antes do OK a desarma**
 (nada mais desfaz sozinho). O SSH/UFW novos continuam valendo. O baseline deixa `/root/baseline-backup-<data>/PENDENTE`
 até a confirmação; o `baseline-verify` e a próxima execução avisam "baseline nunca confirmado".
+
+A volta (`volta.sh`) restaura **só o que o próprio baseline grava**: o `10-baseline.conf` (e o arquivo da v1 que ele moveu), as regras do UFW
+marcadas `# baseline:` (com as políticas padrão e ativo/inativo de antes) e o `snmpd.conf` se o que está lá foi gerado por ele.
+Arquivos e regras de **outros produtos** (ex.: `01-dns-admin.conf`), mesmo alterados dentro da janela de 5 minutos, ficam como estão.
 
 Se isso acontecer:
 
@@ -120,7 +124,7 @@ Tudo aparece no **RESUMO** antes de "Aplicar?" e é conferido pelo `baseline-ver
 O `baseline-verify` só é instalado em `/usr/local/sbin` no **fim** (etapa 4/4). Se a execução para antes (conflito de SSH, autoteste…), o
 `sudo baseline-verify` instalado ainda é o da **versão anterior**. Por isso toda mensagem "Abortado" termina com
 `Para conferir com a versão nova: sudo bash <pasta do script>/baseline-verify.sh`. O verify também imprime a **sua própria versão**
-no cabeçalho (`baseline-verify v2.2.0`) separada da versão que aplicou o padrão (`padrão aplicado pela v…`).
+no cabeçalho (`baseline-verify v2.2.1`) separada da versão que aplicou o padrão (`padrão aplicado pela v…`).
 
 ## SNMP: snmpd.conf de outro produto e teste real
 
@@ -194,7 +198,7 @@ não perguntar de novo). Formato: uma `CHAVE="valor"` por linha, **sem senha nem
 
 | Chave | Conteúdo | Exemplo | Desde |
 |---|---|---|---|
-| `BASELINE_VERSAO` | versão do baseline que gravou o arquivo | `2.2.0` | 2.0.0 |
+| `BASELINE_VERSAO` | versão do baseline que gravou o arquivo | `2.2.1` | 2.0.0 |
 | `ADMIN_USER` | usuário administrador (único com sudo/SSH garantido) | `admin` | 2.0.0 |
 | `SSH_PORT` | porta do SSH | `44320` | 2.0.0 |
 | `GESTAO_SSH` | IPs/redes autorizados a acessar o SSH (origens de gestão) | `192.0.2.10 198.51.100.0/24` | 2.0.0 |

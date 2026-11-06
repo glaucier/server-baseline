@@ -6,7 +6,7 @@
 # Lê /root/baseline.env (respostas da última execução, sem senha) — sem executá-lo.
 # =============================================================================
 set -uo pipefail
-VERIFY_VERSAO="2.2.0"      # a versão DESTE verify (BASELINE_VERSAO, no .env, é a de quem aplicou o padrão)
+VERIFY_VERSAO="2.2.1"      # a versão DESTE verify (BASELINE_VERSAO, no .env, é a de quem aplicou o padrão)
 PASS=0; FAIL=0; AVISO=0
 
 ENV_FILE=/root/baseline.env

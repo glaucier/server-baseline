@@ -20,7 +20,7 @@
 # =============================================================================
 set -uo pipefail
 
-VERSAO="2.2.0"
+VERSAO="2.2.1"
 ENV_FILE=/root/baseline.env
 ENV_ANTIGO=/root/g2-baseline.env          # v1 (g2-baseline): lido como padrão, nunca alterado
 TS=$(date +%Y%m%d-%H%M%S)
@@ -31,6 +31,7 @@ SSHD_ARQ=/etc/ssh/sshd_config.d/10-baseline.conf
 SNMPD_ARQ=/etc/snmp/snmpd.conf
 SNMPD_OUTRO=nao
 SSHD_ANTIGO=/etc/ssh/sshd_config.d/10-g2-hardening.conf
+UFW_DEFAULT_ARQ=/etc/default/ufw
 VOLTA_MIN=5
 
 # ---- Saída -------------------------------------------------------------------------------------
@@ -538,6 +539,61 @@ agentaddress udp:$V4:161,udp:127.0.0.1:161
 sysLocation "$SNMP_LOCATION"
 sysContact $SNMP_CONTACT
 rouser $SNMP_USER priv
+EOF
+}
+
+# ---- Volta automática: restaura SÓ o que o próprio baseline grava --------------------------------------------------
+# Política de DEFAULT_*_POLICY do /etc/default/ufw para o argumento do `ufw default`
+ufw_politica() { case $1 in DROP) echo deny;; REJECT) echo reject;; ACCEPT) echo allow;; esac; }
+# stdout = comandos (validados) que devolvem as políticas padrão e as regras UFW marcadas "baseline:" de ANTES desta execução.
+# Lê `ufw status` e o /etc/default/ufw AGORA (antes de mexer); só reconhece o formato exato das regras do baseline.
+ufw_estado_antes() {
+  local inc out l porta proto src texto re
+  local -A ja_vi=()
+  inc=$(sed -n 's/^DEFAULT_INPUT_POLICY="\{0,1\}\([A-Z]*\).*/\1/p' "$UFW_DEFAULT_ARQ" 2>/dev/null | head -1)
+  out=$(sed -n 's/^DEFAULT_OUTPUT_POLICY="\{0,1\}\([A-Z]*\).*/\1/p' "$UFW_DEFAULT_ARQ" 2>/dev/null | head -1)
+  [[ -n "$(ufw_politica "$inc")" ]] && echo "ufw default $(ufw_politica "$inc") incoming >/dev/null"
+  [[ -n "$(ufw_politica "$out")" ]] && echo "ufw default $(ufw_politica "$out") outgoing >/dev/null"
+  re='^([0-9]{1,5})/(tcp|udp)([[:space:]]+\(v6\))?[[:space:]]+ALLOW([[:space:]]+IN)?[[:space:]]+([0-9A-Fa-f:./]+)[[:space:]]+#[[:space:]]+(baseline:[A-Za-z0-9 _:-]*)$'
+  while IFS= read -r l; do
+    [[ "$l" =~ $re ]] || continue
+    porta=${BASH_REMATCH[1]}; proto=${BASH_REMATCH[2]}; src=${BASH_REMATCH[5]}; texto=${BASH_REMATCH[6]}
+    texto=${texto%"${texto##*[![:space:]]}"}
+    [[ -n "${ja_vi[$porta/$proto/$src]+x}" ]] && continue
+    ja_vi[$porta/$proto/$src]=1
+    echo "ufw allow from '$src' to any port $porta proto $proto comment '$texto' >/dev/null"
+  done < <(ufw status 2>/dev/null | grep '# baseline:')
+}
+# stdout = o volta.sh. Restaura SÓ:
+#   - SSH: o 10-baseline.conf (apaga o novo; devolve o de antes, se havia) e o arquivo da v1 que o baseline moveu;
+#   - UFW: as regras com o comentário "baseline:" (apaga as atuais e recoloca as de antes), as políticas padrão e ativo/inativo;
+#   - SNMP: o snmpd.conf, e só se o que está lá foi gerado pelo baseline.
+# Arquivos e regras de OUTROS produtos (ex.: 01-dns-admin.conf) ficam EXATAMENTE como estão no momento da volta.
+gerar_volta() {
+  cat <<EOF
+#!/bin/bash
+# Volta automática do baseline $TS — restaura SÓ o que o baseline grava (SSH: $(basename "$SSHD_ARQ"); UFW: regras "baseline:"; SNMP: snmpd.conf gerado por ele)
+logger -t baseline "VOLTA AUTOMÁTICA: restaurando SSH e UFW do baseline (backup $BK)"
+rm -f "$SSHD_ARQ"
+[ -f "$BK/sshd_config.d/$(basename "$SSHD_ARQ")" ] && cp -a "$BK/sshd_config.d/$(basename "$SSHD_ARQ")" "$SSHD_ARQ"
+[ -f "$BK/$(basename "$SSHD_ANTIGO")" ] && cp -a "$BK/$(basename "$SSHD_ANTIGO")" "$SSHD_ANTIGO"
+n=""
+while n=\$(ufw status numbered 2>/dev/null | awk -F'[][]' '/# baseline:/{gsub(/ /,"",\$2); print \$2}' | sort -n | tail -1); [ -n "\$n" ]; do
+  ufw --force delete "\$n" >/dev/null || break
+done
+$(ufw_estado_antes)
+if [ "$UFW_ANTES" = active ]; then ufw reload; else ufw --force disable; fi
+if [ -f "$BK/snmpd.conf" ] && head -1 "$SNMPD_ARQ" 2>/dev/null | grep -q '^# Gerado por baseline'; then
+  cp -a "$BK/snmpd.conf" "$SNMPD_ARQ"
+  systemctl is-active --quiet snmpd && systemctl restart snmpd
+fi
+if [ "$SOCKET_ANTES" = enabled ]; then
+  systemctl disable ssh.service; systemctl enable ssh.socket; systemctl daemon-reload
+  systemctl stop ssh.service; systemctl restart ssh.socket
+else
+  systemctl restart ssh.service
+fi
+rm -f "$BK/PENDENTE"
 EOF
 }
 
@@ -1204,23 +1260,8 @@ fi
 # 3. SSH + UFW (com volta automática)
 # =================================================================================================
 info "3/4 SSH e firewall"
-# Volta automática: armada ANTES de mexer; restaura SSH e UFW como estavam se não houver confirmação.
-cat > "$BK/volta.sh" <<EOF
-#!/bin/bash
-# Volta automática do baseline $TS — restaura SSH e UFW de antes
-logger -t baseline "VOLTA AUTOMÁTICA: restaurando SSH e UFW (backup $BK)"
-rm -f "$SSHD_ARQ"
-cp -a "$BK/sshd_config.d/." /etc/ssh/sshd_config.d/ 2>/dev/null
-cp -a "$BK/ufw/." /etc/ufw/ 2>/dev/null
-if [ "$UFW_ANTES" = active ]; then ufw reload; else ufw --force disable; fi
-if [ "$SOCKET_ANTES" = enabled ]; then
-  systemctl disable ssh.service; systemctl enable ssh.socket; systemctl daemon-reload
-  systemctl stop ssh.service; systemctl restart ssh.socket
-else
-  systemctl restart ssh.service
-fi
-rm -f "$BK/PENDENTE"
-EOF
+# Volta automática: armada ANTES de mexer; se não houver confirmação restaura SÓ o que o baseline grava (gerar_volta).
+gerar_volta > "$BK/volta.sh"
 chmod 700 "$BK/volta.sh"
 VOLTA_UNIT="baseline-volta-$TS"
 systemd-run --quiet --unit="$VOLTA_UNIT" --on-active="${VOLTA_MIN}min" /bin/bash "$BK/volta.sh" \
