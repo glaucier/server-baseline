@@ -26,6 +26,7 @@ ENV_ANTIGO=/root/g2-baseline.env          # v1 (g2-baseline): lido como padrão,
 TS=$(date +%Y%m%d-%H%M%S)
 LOG=/root/baseline-$TS.log
 BK=/root/baseline-backup-$TS
+SSHD_PRINCIPAL=/etc/ssh/sshd_config
 SSHD_ARQ=/etc/ssh/sshd_config.d/10-baseline.conf
 SSHD_ANTIGO=/etc/ssh/sshd_config.d/10-g2-hardening.conf
 VOLTA_MIN=5
@@ -244,12 +245,172 @@ remover_marcador_autoteste() {
 }
 limpar_temp() { local d; for d in "${TMPS[@]:-}"; do [[ -n "$d" ]] && rm -rf -- "$d"; done; remover_marcador_autoteste; }
 
-# Pares "chave valor" do sshd -T que a configuração escolhida tem de produzir (minúsculas, como o sshd imprime)
-sshd_pares() {
+# ---- Outros arquivos do sshd que VENCEM o 10-baseline.conf (o sshd usa a 1.ª ocorrência) ----------------------------
+# Lê a ORDEM REAL de leitura (sshd_config + Include, glob em ordem bytewise; o 10-baseline.conf entra no lugar em que o padrão o encaixa,
+# mesmo que ainda não exista) e diz quem define cada diretiva.  NUNCA escreve em arquivo de outro produto.
+#   py_ssh plano  PRINCIPAL NOSSO CAND SAIDA [IGNORAR..]   grava em SAIDA o sshd_config com os Include expandidos e CAND no lugar de NOSSO
+#                                                           (retorno 3 = o sshd_config não inclui NOSSO: ele seria ignorado)
+#   py_ssh dono   PRINCIPAL NOSSO CAND DIRETIVA [IGNORAR..] linhas "arquivo<TAB>linha<TAB>valor<TAB>ANTES|DEPOIS<TAB>0|1(Match)"
+py_ssh() { python3 -I - "$@" <<'PY'
+import fnmatch, glob, os, re, sys
+
+def ler(caminho):
+    try:
+        with open(caminho, encoding="utf-8", errors="replace") as f:
+            return f.read().splitlines()
+    except OSError:
+        return None
+
+KV = re.compile(r"^([A-Za-z0-9]+)\s*(?:=\s*|\s+)(.*)$")
+
+def kv(texto):
+    t = texto.strip()
+    if not t or t.startswith("#"):
+        return None
+    m = KV.match(t)
+    return (m.group(1).lower(), m.group(2).strip()) if m else None
+
+def includes(texto):
+    r = kv(texto)
+    return r[1].split() if r and r[0] == "include" else None
+
+def expande(padrao, base, nosso, ignorar):
+    if not os.path.isabs(padrao):
+        padrao = os.path.join(base, padrao)
+    achados = {f for f in glob.glob(padrao) if os.path.isfile(f)}
+    if fnmatch.fnmatchcase(nosso, padrao):
+        achados.add(nosso)
+    return sorted(f for f in achados if f not in ignorar)
+
+def percorre(caminho, base, nosso, cand, ignorar, prof=0):
+    linhas = ler(cand if caminho == nosso else caminho)
+    if linhas is None:
+        return
+    seg = []
+    for num, texto in enumerate(linhas, 1):
+        pads = includes(texto)
+        if pads is not None and prof < 5:
+            if seg:
+                yield (caminho, seg)
+                seg = []
+            for pad in pads:
+                for f in expande(pad, base, nosso, ignorar):
+                    yield from percorre(f, base, nosso, cand, ignorar, prof + 1)
+        else:
+            seg.append((num, texto))
+    if seg:
+        yield (caminho, seg)
+
+modo = sys.argv[1]
+if modo == "plano":
+    principal, nosso, cand, saida = sys.argv[2:6]
+    ignorar = set(sys.argv[6:])
+    base = os.path.dirname(principal)
+    linhas = ler(principal)
+    if linhas is None:
+        sys.exit(2)
+    out = []
+    for texto in linhas:
+        pads = includes(texto)
+        if pads is None:
+            out.append(texto)
+            continue
+        for pad in pads:
+            for f in expande(pad, base, nosso, ignorar):
+                out.append("Include " + (cand if f == nosso else f))
+    with open(saida, "w", encoding="utf-8") as f:
+        f.write("\n".join(out) + "\n")
+    incluiu = any(c == nosso for c, _ in percorre(principal, base, nosso, cand, ignorar))
+    sys.exit(0 if incluiu else 3)
+elif modo == "dono":
+    principal, nosso, cand, diretiva = sys.argv[2:6]
+    diretiva = diretiva.lower()
+    ignorar = set(sys.argv[6:])
+    base = os.path.dirname(principal)
+    passou = False
+    match = {}
+    antes, outros = [], []
+    for caminho, seg in percorre(principal, base, nosso, cand, ignorar):
+        if caminho == nosso:
+            passou = True
+            continue
+        for num, texto in seg:
+            r = kv(texto)
+            if not r:
+                continue
+            if r[0] == "match":
+                match[caminho] = True
+                continue
+            if r[0] == diretiva:
+                cond = match.get(caminho, False)
+                reg = "%s\t%d\t%s\t%s\t%d" % (os.path.basename(caminho), num, r[1], "DEPOIS" if passou else "ANTES", 1 if cond else 0)
+                (outros if (cond or passou) else antes).append(reg)
+    for reg in antes + outros:
+        print(reg)
+else:
+    sys.exit(2)
+PY
+}
+
+# Nome canônico (como no sshd_config) de uma diretiva em minúsculas
+ssh_nome() {
+  case $1 in
+    port) echo Port;; permitrootlogin) echo PermitRootLogin;; passwordauthentication) echo PasswordAuthentication;;
+    kbdinteractiveauthentication) echo KbdInteractiveAuthentication;; pubkeyauthentication) echo PubkeyAuthentication;;
+    maxauthtries) echo MaxAuthTries;; x11forwarding) echo X11Forwarding;; allowtcpforwarding) echo AllowTcpForwarding;;
+    allowagentforwarding) echo AllowAgentForwarding;; allowusers) echo AllowUsers;; logingracetime) echo LoginGraceTime;;
+    clientaliveinterval) echo ClientAliveInterval;; clientalivecountmax) echo ClientAliveCountMax;; *) echo "$1";;
+  esac
+}
+# Valor ESCOLHIDO (real) é menos seguro que o ESCOLHIDO? ssh_menos_seguro DIRETIVA ESCOLHIDO EFETIVO
+ssh_menos_seguro() {
+  case $1 in
+    passwordauthentication|kbdinteractiveauthentication|x11forwarding|allowagentforwarding|allowtcpforwarding|permitrootlogin)
+      [[ "$2" == no && "$3" != no ]];;
+    pubkeyauthentication) [[ "$2" == yes && "$3" != yes ]];;
+    maxauthtries) [[ "$2" =~ ^[0-9]+$ && "$3" =~ ^[0-9]+$ ]] && (( $3 > $2 ));;
+    port|allowusers) return 0;;       # conjuntos: qualquer diferença (porta a mais, usuário a mais) é tratada como menos segura
+    *) return 1;;
+  esac
+}
+# conforto (só avisa) | parar (segurança, valor menos seguro) | restritivo (segurança, valor MAIS seguro: só avisa)
+ssh_classe() {
+  case $1 in
+    logingracetime|clientaliveinterval|clientalivecountmax) echo conforto;;
+    *) if ssh_menos_seguro "$1" "$2" "$3"; then echo parar; else echo restritivo; fi;;
+  esac
+}
+# Quem define a diretiva $1 (NOME [+ "(dentro de um bloco Match)"]) ou texto de "não identifiquei"; $2 = arquivo candidato
+ssh_quem() {
+  local l n c
+  IFS= read -r l < <(py_ssh dono "$SSHD_PRINCIPAL" "$SSHD_ARQ" "${2:-$SSHD_ARQ}" "$1" "$SSHD_ANTIGO")
+  [[ -n "$l" ]] || { echo "outro arquivo (não identifiquei qual — veja: sshd -T)"; return 0; }
+  IFS=$'\t' read -r n _ _ _ c <<<"$l"
+  [[ "$c" == 1 ]] && n+=" (dentro de um bloco Match)"
+  echo "$n"
+}
+# Todos os arquivos que definem a diretiva (separados por vírgula), para as cumulativas (Port, AllowUsers)
+ssh_quem_todos() {
+  local l n nomes=""
+  while IFS= read -r l; do
+    n=${l%%$'\t'*}; [[ ", $nomes, " == *", $n, "* ]] || nomes+="${nomes:+, }$n"
+  done < <(py_ssh dono "$SSHD_PRINCIPAL" "$SSHD_ARQ" "${2:-$SSHD_ARQ}" "$1" "$SSHD_ANTIGO")
+  echo "${nomes:-outro arquivo (não identifiquei qual)}"
+}
+
+# O que a configuração ESCOLHIDA escreve no 10-baseline.conf ("chave valor", minúsculas, como o sshd -T imprime)
+sshd_escolhido() {
   printf '%s\n' "port $SSH_PORT" "permitrootlogin no" "passwordauthentication no" "kbdinteractiveauthentication no" \
     "pubkeyauthentication yes" "maxauthtries 3" "x11forwarding no" \
     "allowtcpforwarding $(yn "$SSH_TCP_FWD")" "allowagentforwarding $(yn "$SSH_AGENT_FWD")" \
     "logingracetime $SSH_GRACE" "clientaliveinterval $SSH_ALIVE_INT" "clientalivecountmax $SSH_ALIVE_MAX"
+}
+# O que o sshd tem de produzir de FATO: o escolhido, trocado pelo valor de quem vence (SSH_OVERRIDE, calculado por ssh_conflitos
+# ANTES do resumo). Sem conflito, é igual ao escolhido. Diferença fora disso continua sendo erro.
+declare -A SSH_OVERRIDE=()
+sshd_pares() {
+  local k v
+  while read -r k v; do printf '%s %s\n' "$k" "${SSH_OVERRIDE[$k]:-$v}"; done < <(sshd_escolhido)
 }
 
 # stdin = saída do sshd -T; imprime o que diverge do escolhido; retorno 1 se divergir (AllowUsers: conjunto exato)
@@ -259,6 +420,8 @@ sshd_diverge() {
   while IFS= read -r par; do
     grep -qxF -- "$par" <<<"$saida" || { echo "    esperado '$par' — efetivo: '$(grep -m1 "^${par%% *} " <<<"$saida")'"; falta=1; }
   done < <(sshd_pares)
+  efet=$(awk '$1=="port"{print $2}' <<<"$saida" | sort -n | tr '\n' ' ')
+  [[ "$efet" == "$SSH_PORT " ]] || { echo "    portas efetivas: ${efet:-(nenhuma)}— esperado: $SSH_PORT"; falta=1; }
   efet=$(awk '$1=="allowusers"{print $2}' <<<"$saida" | sort | tr '\n' ' ')
   esp=$(tr ' ' '\n' <<<"$SSH_USUARIOS" | sort | tr '\n' ' ')
   [[ "$efet" == "$esp" ]] || { echo "    AllowUsers efetivo: ${efet:-(nenhum)}— esperado: $esp"; falta=1; }
@@ -281,6 +444,53 @@ gerar_sshd_conf() {
   echo "LoginGraceTime $SSH_GRACE"
   echo "ClientAliveInterval $SSH_ALIVE_INT"
   echo "ClientAliveCountMax $SSH_ALIVE_MAX"
+}
+
+# ANTES do resumo: simula o sshd com o 10-baseline.conf CANDIDATO no lugar certo da ordem de leitura (sshd -T -f, sem aplicar nada) e
+# compara com o escolhido. Preenche SSH_CONF_PARAR (segurança MENOS segura: parar), SSH_CONF_AVISO (conforto / mais restritivo: avisar
+# e seguir) e SSH_OVERRIDE (o valor que vence, que o autoteste passa a esperar). Não escreve em arquivo de ninguém.
+SSH_CONF_PARAR=(); SSH_CONF_AVISO=()
+ssh_conflitos() {
+  local cand plano real k want rv cls nome quem rc extras
+  SSH_CONF_PARAR=(); SSH_CONF_AVISO=(); SSH_OVERRIDE=()
+  cand=$(mktemp) && plano=$(mktemp) || { SSH_CONF_AVISO+=("sem espaço para os temporários: conflitos de SSH só serão conferidos depois de aplicar"); return 0; }
+  TMPS+=("$cand" "$plano")
+  gerar_sshd_conf > "$cand"
+  py_ssh plano "$SSHD_PRINCIPAL" "$SSHD_ARQ" "$cand" "$plano" "$SSHD_ANTIGO"; rc=$?
+  if (( rc == 3 )); then
+    SSH_CONF_PARAR+=("$SSHD_PRINCIPAL não inclui $SSHD_ARQ (falta 'Include /etc/ssh/sshd_config.d/*.conf'): o sshd IGNORARIA o 10-baseline.conf e nada do que você escolheu valeria")
+    return 0
+  fi
+  (( rc == 0 )) || { SSH_CONF_AVISO+=("não consegui ler $SSHD_PRINCIPAL para prever o sshd efetivo: conferirei só depois de aplicar"); return 0; }
+  real=$(sshd -T -f "$plano" -C "user=$ADMIN_USER,host=localhost,addr=127.0.0.1" 2>&1) \
+    || { SSH_CONF_AVISO+=("não consegui simular o sshd (sshd -T: $(head -1 <<<"$real")): conferirei só depois de aplicar"); return 0; }
+  while read -r k want; do
+    nome=$(ssh_nome "$k")
+    case $k in
+      port)
+        rv=$(awk '$1=="port"{print $2}' <<<"$real" | sort -n | tr '\n' ' '); rv=${rv% }
+        [[ "$rv" == "$want" ]] && continue
+        SSH_CONF_PARAR+=("SSH $nome: escolhido $want, mas o sshd escutaria em: ${rv:-nenhuma} ($(ssh_quem_todos "$k" "$cand") define Port; Port ACUMULA entre arquivos) — a porta/UFW do baseline não valeriam")
+        ;;
+      *)
+        rv=$(awk -v k="$k" '$1==k{print $2; exit}' <<<"$real")
+        [[ "$rv" == "$want" ]] && continue
+        quem=$(ssh_quem "$k" "$cand"); cls=$(ssh_classe "$k" "$want" "$rv")
+        if [[ "$cls" == parar ]]; then
+          SSH_CONF_PARAR+=("SSH $nome: escolhido $want, mas $quem define $rv e VENCE (o sshd usa a 1.ª ocorrência) — valor MENOS seguro")
+        else
+          SSH_OVERRIDE[$k]=$rv
+          SSH_CONF_AVISO+=("SSH $nome: escolhido $want, mas $quem define $rv e VENCE (o sshd usa a 1.ª ocorrência)$([[ "$cls" == restritivo ]] && echo ' — mais restritivo que o escolhido')")
+        fi
+        ;;
+    esac
+  done < <(sshd_escolhido)
+  rv=$(awk '$1=="allowusers"{print $2}' <<<"$real" | sort | tr '\n' ' '); rv=${rv% }
+  want=$(tr ' ' '\n' <<<"$SSH_USUARIOS" | sort | tr '\n' ' '); want=${want% }
+  if [[ "$rv" != "$want" ]]; then
+    extras=$(comm -13 <(tr ' ' '\n' <<<"$want") <(tr ' ' '\n' <<<"$rv") | tr '\n' ' ')
+    SSH_CONF_PARAR+=("SSH AllowUsers: escolhido $SSH_USUARIOS, mas $(ssh_quem_todos allowusers "$cand") ${extras:+acrescenta ${extras% } }(AllowUsers ACUMULA entre arquivos): efetivo = ${rv:-ninguém} — acesso diferente do escolhido")
+  fi
 }
 
 # Autoteste (depois do restart, antes de pedir o OK). Dois níveis:
@@ -735,6 +945,15 @@ o cliente responde sozinho. 0 desliga a verificação. Faixa 0–3600." "300" "$
 pergunta SSH_ALIVE_MAX "Falhas seguidas antes de derrubar (ClientAliveCountMax)" \
 "Com 300 s e 2 falhas, uma conexão morta cai em cerca de 10 min. Faixa 1–10." "2" "$(p SSH_ALIVE_MAX 2)" val_alive_max
 
+# Conflitos com arquivos de OUTROS produtos no sshd (o sshd usa a 1.ª ocorrência): detectados ANTES do resumo, sem alterar nada
+ssh_conflitos
+if (( ${#SSH_CONF_PARAR[@]} )); then
+  echo; echo -e "  \e[1;31mO SSH escolhido NÃO valeria, porque outro arquivo vence com valor menos seguro:\e[0m"
+  for x in "${SSH_CONF_PARAR[@]}"; do echo "    - $x"; done
+  echo "  O baseline NUNCA edita nem move arquivo de outro produto: ajuste a diretiva no arquivo indicado (ou escolha outro valor) e rode de novo."
+  pare "Nada foi alterado (conflito de SSH com outro arquivo)"
+fi
+
 info "Atalhos de terminal e Ubuntu Pro"
 AT_PADRAO="r=reset"; [[ -n "${PADRAO[ATALHOS]+x}" ]] && AT_PADRAO=${PADRAO[ATALHOS]:-nenhum}
 pergunta ATALHOS "Atalhos de terminal (alias) para TODOS os usuários, inclusive root?" \
@@ -811,6 +1030,7 @@ echo "  SSH ................: porta $SSH_PORT, só chave, sem root, administrado
 echo "  SSH AllowUsers .....: $SSH_USUARIOS"
 echo "  SSH encaminhamento .: portas TCP=$SSH_TCP_FWD, agente=$SSH_AGENT_FWD"
 echo "  SSH tempos .........: login ${SSH_GRACE}s; verificação a cada ${SSH_ALIVE_INT}s x ${SSH_ALIVE_MAX}"
+for x in "${SSH_CONF_AVISO[@]}"; do aviso "$x"; done
 [[ -n "$NOVO_FP" ]] && echo "  Chave nova .........: $NOVO_FP"
 echo "  UFW (entrada) ......: negar tudo, exceto:"
 echo "      SSH $SSH_PORT/tcp de: $GESTAO_SSH"

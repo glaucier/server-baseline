@@ -36,6 +36,7 @@ monta_sshd() { # $1 = linhas extras (ex.: AllowGroups)
   mkdir -p "$TMP/conf.d"; rm -f "$TMP"/conf.d/*
   gerar_sshd_conf > "$TMP/conf.d/10-baseline.conf"
   [[ -n "${1:-}" ]] && printf '%s\n' "$1" > "$TMP/conf.d/20-extra.conf"
+  [[ -n "${OUTRO:-}" ]] && printf '%s\n' "$OUTRO" > "$TMP/conf.d/01-outro.conf"      # arquivo "de outro produto", ordena ANTES do 10-baseline.conf
   printf 'HostKey %s\nListenAddress 127.0.0.1\nUsePAM no\nPidFile %s\nSubsystem sftp internal-sftp\nInclude %s/conf.d/*.conf\n' \
     "$TMP/hostkey" "$TMP/sshd.pid" "$TMP" > "$TMP/sshd_config"
 }
@@ -55,6 +56,7 @@ autoteste_com_hostkey_de_teste() {
     SSH_ALIVE_INT=300; SSH_ALIVE_MAX=2; TS=integ; H=$H; AK=$AK
     # sshd -T do sistema não conhece o sshd de teste: aponta para o arquivo de teste
     sshd() { /usr/sbin/sshd -f "$TMP/sshd_config" "$@"; }
+    [[ ${USE_OVR:-0} == 1 ]] && eval "$OVR_DECL"      # esperado REAL calculado por ssh_conflitos (antes de aplicar)
     autoteste_ssh )
 }
 
@@ -100,6 +102,28 @@ monta_sshd "AllowUsers intruso"
 sobe_sshd || { echo "sshd de teste não subiu"; exit 1; }
 t "AllowUsers acumulado em outro arquivo é detectado" deve_falhar autoteste_com_hostkey_de_teste
 t "...e o motivo é a divergência de AllowUsers (camada 1)" bash -c 'out=$("$1"); [[ "$out" == *"diverge do escolhido"* && "$out" == *"intruso"* ]]' _ "$TMP/motivo_login.sh"
+
+echo "  -- outro produto (01-outro.conf) vence no conforto: ssh_conflitos + autoteste com o esperado REAL"
+OUTRO=$'ClientAliveInterval 3\nClientAliveCountMax 15'
+monta_sshd ""
+SSHD_PRINCIPAL=$TMP/sshd_config; SSHD_ARQ=$TMP/conf.d/10-baseline.conf; SSHD_ANTIGO=$TMP/conf.d/10-g2-hardening.conf
+SU=$USR
+ssh_conflitos
+t "ssh_conflitos: nada para parar" test "${#SSH_CONF_PARAR[@]}" -eq 0
+t "ssh_conflitos: dois avisos de conforto (ClientAliveInterval e CountMax)" test "${#SSH_CONF_AVISO[@]}" -eq 2
+OVR_DECL=$(declare -p SSH_OVERRIDE)
+sobe_sshd || { echo "sshd de teste não subiu"; exit 1; }
+USE_OVR=1
+t "autoteste (login REAL do admin) passa com o esperado real, mesmo com o 01-outro vencendo" autoteste_com_hostkey_de_teste
+USE_OVR=0
+t "(controle) com a expectativa ANTIGA o mesmo cenário abortava — o erro do teste na VM" deve_falhar autoteste_com_hostkey_de_teste
+cria_helper_motivo
+t "...com a mensagem do incidente: esperado 'clientaliveinterval 300' — efetivo: 'clientaliveinterval 3'" bash -c 'out=$("$1"); [[ "$out" == *"esperado '"'"'clientaliveinterval 300'"'"' — efetivo: '"'"'clientaliveinterval 3'"'"'"* ]]' _ "$TMP/motivo_login.sh"
+USE_OVR=1
+printf 'LoginGraceTime 99\n' > "$TMP/conf.d/00-surpresa.conf"
+sobe_sshd || { echo "sshd de teste não subiu"; exit 1; }
+t "diferença INESPERADA (arquivo novo depois da simulação) continua abortando o autoteste" deve_falhar autoteste_com_hostkey_de_teste
+OUTRO=""
 
 echo
 (( FALHAS )) && { echo "    integração: $FALHAS de $N falharam"; exit 1; }

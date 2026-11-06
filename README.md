@@ -85,6 +85,24 @@ O `baseline-verify` confere esses itens pelo `sshd -T -C user=<admin>,…` (efet
 é comparado como **conjunto exato**: um `AllowUsers` a mais em outro arquivo de `sshd_config.d` (a diretiva acumula) dá FALHA.
 Servidores que rodaram a v2.0.0 ainda não têm essas chaves no `.env`: o verify mostra AVISO até você rodar o baseline de novo.
 
+### Quando outro arquivo do SSH vence (o sshd usa a 1.ª ocorrência)
+
+Outros produtos (ex.: o DNS Admin, com `01-dns-admin.conf`) também gravam em `/etc/ssh/sshd_config.d/`. Como o sshd vale a **1.ª ocorrência**
+de cada diretiva e os arquivos são lidos em ordem de nome (e o `sshd_config` principal, antes do `Include`), um arquivo que ordena **antes** do
+`10-baseline.conf` vence. **Antes do resumo** o baseline simula o sshd (`sshd -T -f`, sem aplicar nada) com o `10-baseline.conf` no lugar certo da
+ordem de leitura e compara com o que você escolheu:
+
+| Situação | O que acontece |
+|---|---|
+| **Conforto** (`ClientAliveInterval`, `ClientAliveCountMax`, `LoginGraceTime`) vencido por outro arquivo | **avisa no resumo** e segue: `SSH ClientAliveInterval: escolhido 300, mas 01-dns-admin.conf define 3 e VENCE (o sshd usa a 1.ª ocorrência)`. O autoteste passa a esperar o valor que **vence**, então outro produto vencendo não aborta |
+| **Segurança** (`Port`, `PasswordAuthentication`, `KbdInteractiveAuthentication`, `PermitRootLogin`, `PubkeyAuthentication`, `AllowUsers`, `MaxAuthTries`, `X11Forwarding`, `AllowTcpForwarding`, `AllowAgentForwarding`) com valor **menos seguro** (inclusive `Port` ou `AllowUsers` **somados** por outro arquivo, que acumulam) | **para antes de aplicar**, nomeando o arquivo. Nada é alterado |
+| Segurança com valor **mais restritivo** (ex.: `MaxAuthTries 2`) | avisa e segue |
+| `sshd_config` sem o `Include` de `sshd_config.d` | para: o `10-baseline.conf` seria ignorado |
+| Diferença **inesperada** depois de aplicar | o autoteste continua abortando e restaurando SSH/UFW |
+
+O baseline **nunca edita nem move arquivo de outro produto**: ajuste a diretiva no arquivo indicado (ou escolha outro valor) e rode de novo.
+O `baseline-verify` aplica a mesma regra: conforto vencido por outro arquivo é **AVISO** ("outro arquivo vence: …"), segurança menos segura é **FALHA** citando o arquivo.
+
 ## Disco, relógio, atalhos de terminal e Ubuntu Pro (perguntas)
 
 Tudo aparece no **RESUMO** antes de "Aplicar?" e é conferido pelo `baseline-verify`.
