@@ -15,6 +15,11 @@ Achados da simulação "como cliente" do DNS Admin (VM Ubuntu 24.04 limpa).
 - **Ubuntu Pro (opcional):** `PRO_ANEXAR` (padrão nao); token sem eco, por arquivo temporário 0600, nunca em argv/log/`.env`/resumo.
 - `docs/release-v2.2.0.md`, README com tabelas das perguntas e a seção "Contrato do baseline.env".
 
+### Corrigido (teste real na VM, 06/11 13:46)
+- O autoteste abortava e restaurava SSH/UFW quando outro produto (`01-dns-admin.conf`: `ClientAliveInterval 3`, `ClientAliveCountMax 15`) ordenava **antes** do `10-baseline.conf` e vencia (o sshd usa a 1.ª ocorrência), e o problema só aparecia **depois** de aplicar.
+  Agora o baseline detecta isso **antes do resumo** (simulação com `sshd -T -f`): conforto vencido → aviso no resumo e o autoteste espera o valor que vence; segurança com valor menos seguro (Port, PasswordAuthentication, PermitRootLogin, PubkeyAuthentication, AllowUsers…) → **para antes de aplicar**, citando o arquivo; diferença inesperada continua abortando. Nunca edita nem move arquivo de outro produto.
+  `baseline-verify`: mesma regra (conforto = AVISO "outro arquivo vence", segurança = FALHA citando o arquivo).
+
 ### Contrato do baseline.env
 - Nenhuma chave existente foi renomeada, removida nem mudou de formato.
 - Chaves **novas** (não fazem parte do contrato; são estado interno): `DISCO_EXPANDIR`, `ATALHOS`, `PRO_ANEXAR`.

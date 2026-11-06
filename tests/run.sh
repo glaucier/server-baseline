@@ -90,7 +90,7 @@ t "detecta AllowUsers a menos"                no_baseline "$D; ! sshd_diverge < 
 t "detecta LoginGraceTime diferente"          no_baseline "$D; ! sshd_diverge < \"$TMP/grace.txt\" >/dev/null"
 
 sec "baseline-verify: itens novos pelo sshd -T efetivo"
-VE='declare -A E=([SSH_TCP_FWD]=nao [SSH_AGENT_FWD]=nao [SSH_GRACE]=30 [SSH_ALIVE_INT]=300 [SSH_ALIVE_MAX]=2 [SSH_USUARIOS]="admin backup")'
+VE='SSHD_PRINCIPAL=/nao/existe; declare -A E=([SSH_TCP_FWD]=nao [SSH_AGENT_FWD]=nao [SSH_GRACE]=30 [SSH_ALIVE_INT]=300 [SSH_ALIVE_MAX]=2 [SSH_USUARIOS]="admin backup")'
 conta() { echo "confere_ssh_efetivo \"\$(cat $1)\" >/dev/null; echo \"\$PASS \$FAIL \$AVISO\""; }
 t "tudo certo: 6 OK, 0 FALHA"   no_verify "$VE; PASS=0; FAIL=0; AVISO=0; $(conta "$TMP/ok.txt") | grep -qx '6 0 0'"
 t "forwarding yes → FALHA"       no_verify "$VE; PASS=0; FAIL=0; AVISO=0; $(conta "$TMP/tcp.txt") | grep -qx '5 1 0'"
@@ -306,6 +306,148 @@ t "salvar_env grava todas as chaves do contrato"         no_baseline "ENV_FILE=\
 t "README documenta cada chave do contrato"              bash -c 'sed -n "/Contrato do baseline.env/,\$p" README.md > "$2"; for k in $1; do grep -q "\`$k\`" "$2" || { echo "README sem $k"; exit 1; }; done' _ "$CONTRATO" "$TMP/contrato.md"
 t "CHANGELOG.md existe e registra a 2.2.0"                bash -c 'grep -q "2.2.0" CHANGELOG.md && grep -qi "renomear\|renomeada\|renomeação" CHANGELOG.md'
 t "nenhum rename silencioso: chaves do contrato continuam no código" bash -c 'for k in SSH_PORT GESTAO_SSH SSH_USUARIOS SNMP_ORIGENS SNMP_USER SNMP_LOCATION SNMP_CONTACT; do grep -q "\b$k\b" baseline.sh || exit 1; done'
+
+
+sec "Conflito de SSH com arquivo de OUTRO produto (o sshd usa a 1.ª ocorrência) — sshd real"
+if command -v sshd >/dev/null 2>&1 || [[ -x /usr/sbin/sshd ]]; then
+export PATH="$PATH:/usr/sbin:/sbin"
+ssh-keygen -q -t ed25519 -N '' -f "$TMP/hk"
+novo_ssh() { # novo_ssh NOME -> cria $TMP/ssh/NOME com sshd_config (HostKey próprio + Include) e conf.d/
+  local d="$TMP/ssh/$1"; mkdir -p "$d/conf.d"
+  printf 'HostKey %s\nInclude %s/conf.d/*.conf\nUsePAM no\n' "$TMP/hk" "$d" > "$d/sshd_config"; echo "$d"
+}
+cat > "$TMP/cfl.sh" <<'EOT'
+source "$RAIZ/baseline.sh"
+D=$1
+SSHD_PRINCIPAL=$D/sshd_config; SSHD_ARQ=$D/conf.d/10-baseline.conf; SSHD_ANTIGO=$D/conf.d/10-g2-hardening.conf
+ADMIN_USER=daemon; SSH_PORT=44320; SSH_USUARIOS=${SU:-daemon}; SSH_TCP_FWD=${TCP:-nao}; SSH_AGENT_FWD=nao; SSH_GRACE=30; SSH_ALIVE_INT=300; SSH_ALIVE_MAX=2; TS=t
+ssh_conflitos
+for x in "${SSH_CONF_PARAR[@]}"; do echo "PARAR|$x"; done
+for x in "${SSH_CONF_AVISO[@]}"; do echo "AVISO|$x"; done
+for k in "${!SSH_OVERRIDE[@]}"; do echo "OVR|$k=${SSH_OVERRIDE[$k]}"; done
+EOT
+cfl() { RAIZ="$RAIZ" bash "$TMP/cfl.sh" "$1"; }
+
+D=$(novo_ssh incidente); printf 'ClientAliveInterval 3\nClientAliveCountMax 15\n' > "$D/conf.d/01-dns-admin.conf"
+cfl "$D" > "$TMP/o.incidente"
+t "o incidente (01-dns-admin.conf: ClientAliveInterval 3 / CountMax 15) NÃO para: só avisa, com a frase exata" bash -c '
+  ! grep -q "^PARAR|" "$1" &&
+  grep -qxF "AVISO|SSH ClientAliveInterval: escolhido 300, mas 01-dns-admin.conf define 3 e VENCE (o sshd usa a 1.ª ocorrência)" "$1" &&
+  grep -qxF "AVISO|SSH ClientAliveCountMax: escolhido 2, mas 01-dns-admin.conf define 15 e VENCE (o sshd usa a 1.ª ocorrência)" "$1"' _ "$TMP/o.incidente"
+t "...e o valor que vence vira o ESPERADO (SSH_OVERRIDE)" bash -c 'grep -qx "OVR|clientaliveinterval=3" "$1" && grep -qx "OVR|clientalivecountmax=15" "$1"' _ "$TMP/o.incidente"
+# o sshd real, com o 10-baseline.conf JÁ aplicado: o autoteste (sshd_diverge) compara com o esperado real
+cat > "$TMP/dv.sh" <<'EOT'
+source "$RAIZ/baseline.sh"
+D=$1
+SSHD_PRINCIPAL=$D/sshd_config; SSHD_ARQ=$D/conf.d/10-baseline.conf; SSHD_ANTIGO=$D/conf.d/10-g2-hardening.conf
+ADMIN_USER=daemon; SSH_PORT=44320; SSH_USUARIOS=daemon; SSH_TCP_FWD=nao; SSH_AGENT_FWD=nao; SSH_GRACE=30; SSH_ALIVE_INT=300; SSH_ALIVE_MAX=2; TS=t
+ssh_conflitos
+gerar_sshd_conf > "$SSHD_ARQ"                                   # "aplica"
+[[ ${USAR_OVR:-1} == 1 ]] || SSH_OVERRIDE=()
+[[ -z "${SURPRESA:-}" ]] || printf '%s\n' "$SURPRESA" > "$D/conf.d/00-surpresa.conf"   # algo muda DEPOIS da simulação (diferença inesperada)
+sshd -T -f "$D/sshd_config" -C user=daemon,host=localhost,addr=127.0.0.1 | sshd_diverge
+EOT
+t "autoteste: efetivo (com o 01-outro vencendo) bate com o esperado REAL → passa" env RAIZ="$RAIZ" bash "$TMP/dv.sh" "$D"
+D2=$(novo_ssh incidente2); printf 'ClientAliveInterval 3\nClientAliveCountMax 15\n' > "$D2/conf.d/01-dns-admin.conf"
+t "(controle) com a expectativa antiga o MESMO cenário divergia — era o bug do teste real" bash -c '! RAIZ="$1" USAR_OVR=0 bash "$2" "$3"' _ "$RAIZ" "$TMP/dv.sh" "$D2"
+D3=$(novo_ssh inesperado); printf 'ClientAliveInterval 3\n' > "$D3/conf.d/01-dns-admin.conf"
+t "diferença INESPERADA (outro arquivo muda DEPOIS da simulação) continua reprovando → abortaria e voltaria" bash -c '! RAIZ="$1" SURPRESA="LoginGraceTime 99" bash "$2" "$3"' _ "$RAIZ" "$TMP/dv.sh" "$D3"
+
+for CASO in "PasswordAuthentication yes|PasswordAuthentication" "PermitRootLogin yes|PermitRootLogin" "PermitRootLogin prohibit-password|PermitRootLogin" \
+            "PubkeyAuthentication no|PubkeyAuthentication" "KbdInteractiveAuthentication yes|KbdInteractiveAuthentication" "X11Forwarding yes|X11Forwarding" \
+            "AllowTcpForwarding yes|AllowTcpForwarding" "AllowAgentForwarding yes|AllowAgentForwarding" "MaxAuthTries 6|MaxAuthTries"; do
+  LINHA=${CASO%%|*}; NOME=${CASO##*|}; D=$(novo_ssh "seg-${LINHA// /_}"); printf '%s\n' "$LINHA" > "$D/conf.d/01-outro.conf"
+  t "segurança menos segura PARA e cita o arquivo: 01-outro.conf → $LINHA" bash -c '
+    out=$(RAIZ="$1" bash "$2" "$3"); grep -q "^PARAR|SSH $4: .*01-outro.conf define .* e VENCE .*MENOS seguro" <<<"$out"' _ "$RAIZ" "$TMP/cfl.sh" "$D" "$NOME"
+done
+D=$(novo_ssh porta22); printf 'Port 22\n' > "$D/conf.d/01-outro.conf"
+t "Port: outro arquivo escutando também na 22 → PARA e cita o arquivo" bash -c 'out=$(RAIZ="$1" bash "$2" "$3"); grep -q "^PARAR|SSH Port: .*01-outro.conf" <<<"$out"' _ "$RAIZ" "$TMP/cfl.sh" "$D"
+D=$(novo_ssh allowusers); printf 'AllowUsers intruso\n' > "$D/conf.d/01-outro.conf"
+t "AllowUsers: outro arquivo SOMA usuário → PARA e cita arquivo e usuário" bash -c 'out=$(RAIZ="$1" bash "$2" "$3"); grep -q "^PARAR|SSH AllowUsers: .*01-outro.conf acrescenta intruso" <<<"$out"' _ "$RAIZ" "$TMP/cfl.sh" "$D"
+D=$(novo_ssh restritivo); printf 'MaxAuthTries 2\nPasswordAuthentication no\n' > "$D/conf.d/01-outro.conf"
+t "segurança MAIS restritiva (MaxAuthTries 2) só avisa e segue" bash -c 'out=$(RAIZ="$1" bash "$2" "$3"); ! grep -q "^PARAR|" <<<"$out" && grep -q "^AVISO|SSH MaxAuthTries: escolhido 3, mas 01-outro.conf define 2 e VENCE.*mais restritivo" <<<"$out"' _ "$RAIZ" "$TMP/cfl.sh" "$D"
+D=$(novo_ssh depois); printf 'ClientAliveInterval 3\nPasswordAuthentication yes\n' > "$D/conf.d/99-depois.conf"
+t "arquivo que ordena DEPOIS do 10-baseline.conf não vence: nada a avisar" bash -c 'out=$(RAIZ="$1" bash "$2" "$3"); [[ -z "$out" ]]' _ "$RAIZ" "$TMP/cfl.sh" "$D"
+D=$(novo_ssh anterior); printf 'ClientAliveInterval 77\nPasswordAuthentication yes\n' > "$D/conf.d/10-baseline.conf"
+t "10-baseline.conf de uma execução ANTERIOR é substituído pelo candidato (não conta como conflito)" bash -c 'out=$(RAIZ="$1" bash "$2" "$3"); [[ -z "$out" ]]' _ "$RAIZ" "$TMP/cfl.sh" "$D"
+D=$(novo_ssh principal); printf 'HostKey %s\nClientAliveInterval 7\nInclude %s/conf.d/*.conf\nUsePAM no\n' "$TMP/hk" "$D" > "$D/sshd_config"
+t "linha no sshd_config ANTES do Include também vence (e é atribuída a sshd_config)" bash -c 'out=$(RAIZ="$1" bash "$2" "$3"); grep -q "^AVISO|SSH ClientAliveInterval: escolhido 300, mas sshd_config define 7 e VENCE" <<<"$out"' _ "$RAIZ" "$TMP/cfl.sh" "$D"
+D=$(novo_ssh depoisdoinclude); printf 'HostKey %s\nInclude %s/conf.d/*.conf\nClientAliveInterval 7\nUsePAM no\n' "$TMP/hk" "$D" > "$D/sshd_config"
+t "linha no sshd_config DEPOIS do Include perde para o 10-baseline.conf" bash -c 'out=$(RAIZ="$1" bash "$2" "$3"); [[ -z "$out" ]]' _ "$RAIZ" "$TMP/cfl.sh" "$D"
+D=$(novo_ssh semincl); printf 'HostKey %s\nUsePAM no\n' "$TMP/hk" > "$D/sshd_config"
+t "sshd_config sem Include de sshd_config.d: PARA (o 10-baseline.conf seria ignorado)" bash -c 'out=$(RAIZ="$1" bash "$2" "$3"); grep -q "^PARAR|.*não inclui .*10-baseline.conf" <<<"$out"' _ "$RAIZ" "$TMP/cfl.sh" "$D"
+D=$(novo_ssh relativo); printf 'HostKey %s\nInclude conf.d/*.conf\nUsePAM no\n' "$TMP/hk" > "$D/sshd_config"; printf 'LoginGraceTime 99\n' > "$D/conf.d/01-outro.conf"
+t "Include com caminho relativo (conf.d/*.conf) também é seguido" bash -c 'out=$(RAIZ="$1" bash "$2" "$3"); grep -q "^AVISO|SSH LoginGraceTime: escolhido 30, mas 01-outro.conf define 99 e VENCE" <<<"$out"' _ "$RAIZ" "$TMP/cfl.sh" "$D"
+D=$(novo_ssh match); printf 'Match User daemon\n  PasswordAuthentication yes\n' > "$D/conf.d/01-outro.conf"
+t "bloco Match de outro arquivo que reabre senha para o admin: PARA e cita o Match" bash -c 'out=$(RAIZ="$1" bash "$2" "$3"); grep -q "^PARAR|SSH PasswordAuthentication: .*01-outro.conf (dentro de um bloco Match) define yes" <<<"$out"' _ "$RAIZ" "$TMP/cfl.sh" "$D"
+D=$(novo_ssh intocado); printf 'ClientAliveInterval 3\nPasswordAuthentication yes\n' > "$D/conf.d/01-outro.conf"; printf 'Port 2222\n' > "$D/conf.d/50-cloud-init.conf"
+( cd "$D" && find . -type f | sort | xargs sha256sum; ls -la --time-style=+%s conf.d ) > "$TMP/antes.sum"
+cfl "$D" >/dev/null
+( cd "$D" && find . -type f | sort | xargs sha256sum; ls -la --time-style=+%s conf.d ) > "$TMP/depois.sum"
+t "NUNCA edita nem move arquivo de outro produto (conteúdo, lista e datas idênticos)" cmp -s "$TMP/antes.sum" "$TMP/depois.sum"
+t "política: nenhum mv/rm/sed -i/escrita em arquivos de sshd_config.d além do próprio (10-baseline.conf) e do da v1" bash -c '
+  ! sed -n "/^ssh_conflitos()/,/^}/p;/^py_ssh()/,/^}/p" baseline.sh | grep -nE "(^|[^a-z_])(mv|rm|sed -i|chmod|chown|install|tee)( |$)|>> *\"?\$SSHD" '
+t "política: o único mv em sshd_config.d é o do arquivo da própria v1 (10-g2-hardening.conf)" bash -c '[[ $(grep -cE "(^|[ ;&])mv .*(sshd_config|SSHD_)" baseline.sh) == 1 ]] && grep -q "mv \"\$SSHD_ANTIGO\" \"\$BK/\"" baseline.sh'
+
+t "ssh_menos_seguro: tabela"  no_baseline '
+  ssh_menos_seguro passwordauthentication no yes && ! ssh_menos_seguro passwordauthentication no no && ! ssh_menos_seguro passwordauthentication yes no &&
+  ssh_menos_seguro permitrootlogin no prohibit-password && ssh_menos_seguro permitrootlogin no yes &&
+  ssh_menos_seguro pubkeyauthentication yes no && ssh_menos_seguro maxauthtries 3 6 && ! ssh_menos_seguro maxauthtries 3 2 &&
+  ssh_menos_seguro allowtcpforwarding no local && ! ssh_menos_seguro allowtcpforwarding yes no && ssh_menos_seguro port 1 2 &&
+  ! ssh_menos_seguro clientaliveinterval 300 3 && [[ $(ssh_classe clientaliveinterval 300 3) == conforto && $(ssh_classe logingracetime 30 120) == conforto ]] &&
+  [[ $(ssh_classe passwordauthentication no yes) == parar && $(ssh_classe maxauthtries 3 2) == restritivo ]]'
+
+# verify: mesma regra, com o sshd real e o 10-baseline.conf já aplicado
+cat > "$TMP/vf.sh" <<'EOT'
+source "$RAIZ/baseline-verify.sh"
+D=$1
+SSHD_PRINCIPAL=$D/sshd_config; SSHD_ARQ=$D/conf.d/10-baseline.conf; SSHD_ANTIGO=$D/conf.d/10-g2-hardening.conf
+declare -A E=([SSH_TCP_FWD]=nao [SSH_AGENT_FWD]=nao [SSH_GRACE]=30 [SSH_ALIVE_INT]=300 [SSH_ALIVE_MAX]=2 [SSH_USUARIOS]=daemon)
+( source "$RAIZ/baseline.sh" >/dev/null 2>&1; ADMIN_USER=daemon; SSH_PORT=44320; SSH_USUARIOS=daemon; SSH_TCP_FWD=nao; SSH_AGENT_FWD=nao; SSH_GRACE=30; SSH_ALIVE_INT=300; SSH_ALIVE_MAX=2; gerar_sshd_conf ) > "$SSHD_ARQ"
+OUT=$(sshd -T -f "$D/sshd_config" -C user=daemon,host=localhost,addr=127.0.0.1)
+PASS=0; FAIL=0; AVISO=0
+ssh_confere_portas 44320 "$OUT"; for par in "permitrootlogin no" "passwordauthentication no" "kbdinteractiveauthentication no" "pubkeyauthentication yes"; do ssh_confere_valor "${par% *}" "${par#* }" "$OUT"; done
+confere_ssh_efetivo "$OUT"
+echo "RES $PASS $FAIL $AVISO"
+EOT
+vf() { RAIZ="$RAIZ" bash "$TMP/vf.sh" "$1"; }
+D=$(novo_ssh vf-limpo)
+t "verify: sem conflito → tudo OK (11 OK, 0 FALHA, 0 AVISO)"       bash -c 'vf=$(RAIZ="$1" bash "$2" "$3"); grep -q "^RES 11 0 0$" <<<"$vf"' _ "$RAIZ" "$TMP/vf.sh" "$D"
+D=$(novo_ssh vf-conforto); printf 'ClientAliveInterval 3\nClientAliveCountMax 15\n' > "$D/conf.d/01-dns-admin.conf"
+t "verify: conforto vencido por outro arquivo → AVISO 'outro arquivo vence', NÃO falha" bash -c '
+  vf=$(RAIZ="$1" bash "$2" "$3" 2>&1); grep -q "^RES 9 0 2$" <<<"$vf" && grep -q "outro arquivo vence: 01-dns-admin.conf define 3 (o baseline escolheu 300)" <<<"$vf"' _ "$RAIZ" "$TMP/vf.sh" "$D"
+D=$(novo_ssh vf-seguranca); printf 'PasswordAuthentication yes\n' > "$D/conf.d/01-outro.conf"
+t "verify: segurança menos segura de outro arquivo → FALHA citando o arquivo" bash -c '
+  vf=$(RAIZ="$1" bash "$2" "$3" 2>&1); grep -q "^RES .* 1 0$" <<<"$vf" && grep -q "passwordauthentication esperado no, efetivo yes — 01-outro.conf VENCE com valor MENOS seguro" <<<"$vf"' _ "$RAIZ" "$TMP/vf.sh" "$D"
+D=$(novo_ssh vf-allowusers); printf 'AllowUsers intruso\n' > "$D/conf.d/01-outro.conf"
+t "verify: AllowUsers somado por outro arquivo → FALHA citando o arquivo" bash -c 'vf=$(RAIZ="$1" bash "$2" "$3" 2>&1); grep -q "allowusers esperado daemon, efetivo daemon intruso (01-outro.conf" <<<"$vf"' _ "$RAIZ" "$TMP/vf.sh" "$D"
+D=$(novo_ssh vf-adulterado)
+cat > "$TMP/vf_adulterado.sh" <<'EOT'
+source "$RAIZ/baseline-verify.sh"
+D=$1
+SSHD_PRINCIPAL=$D/sshd_config; SSHD_ARQ=$D/conf.d/10-baseline.conf; SSHD_ANTIGO=$D/conf.d/10-g2-hardening.conf
+printf 'LoginGraceTime 11\n' > "$SSHD_ARQ"                    # alguém editou o arquivo do baseline: nenhum OUTRO arquivo o define
+PASS=0; FAIL=0; AVISO=0
+ssh_confere_valor logingracetime 30 "$(sshd -T -f "$D/sshd_config" -C user=daemon,host=localhost,addr=127.0.0.1)" 2>&1
+echo "RES $PASS $FAIL $AVISO"
+EOT
+t "verify: diferença SEM dono conhecido (10-baseline.conf editado) → FALHA" bash -c 'out=$(RAIZ="$1" bash "$2" "$3"); grep -q "^RES 0 1 0$" <<<"$out" && grep -q "10-baseline.conf foi editado" <<<"$out"' _ "$RAIZ" "$TMP/vf_adulterado.sh" "$D"
+t "verify: o bloco py_ssh/ssh_* é CÓPIA EXATA do baseline.sh" bash -c '
+  a=$(source ./baseline.sh; declare -f py_ssh ssh_nome ssh_menos_seguro ssh_classe ssh_quem ssh_quem_todos)
+  b=$(source ./baseline-verify.sh; declare -f py_ssh ssh_nome ssh_menos_seguro ssh_classe ssh_quem ssh_quem_todos)
+  [[ -n $a && "$a" == "$b" ]]'
+t "verify: não usa mais 'grep -qx' puro para port/permitrootlogin/… (agora explica quem vence)" bash -c '! grep -nE "chk \"sshd efetivo: \\\$par\"" baseline-verify.sh'
+
+sec "Conflito de SSH — fluxo do baseline.sh"
+t "ssh_conflitos roda DEPOIS das perguntas de SSH e ANTES do resumo/aplicação" bash -c '
+  a=$(grep -n "^pergunta SSH_ALIVE_MAX" baseline.sh | cut -d: -f1); b=$(grep -n "^ssh_conflitos$" baseline.sh | cut -d: -f1)
+  c=$(grep -n "RESUMO — nada foi alterado" baseline.sh | cut -d: -f1); d=$(grep -n "^gerar_sshd_conf > \"\$SSHD_ARQ\"" baseline.sh | cut -d: -f1)
+  [[ -n $a && -n $b && -n $c && -n $d && $a -lt $b && $b -lt $c && $c -lt $d ]]'
+t "conflito de segurança chama pare ANTES de qualquer alteração"  bash -c 'grep -A8 "^ssh_conflitos$" baseline.sh | grep -q "SSH_CONF_PARAR\[@\]" && grep -A8 "^ssh_conflitos$" baseline.sh | grep -q "pare \"Nada foi alterado"'
+t "o resumo lista os avisos de conflito de conforto"              bash -c 'sed -n "/RESUMO — nada foi alterado/,/read -rp \"Aplicar/p" baseline.sh | grep -q "SSH_CONF_AVISO\[@\]"'
+else
+  if [[ ${BASELINE_EXIGE_SSHD:-0} == 1 ]]; then N=$((N+1)); FALHAS=$((FALHAS+1)); echo "  FALHA sshd ausente: testes de conflito de SSH não rodaram"; else echo "  skip  sshd não instalado"; fi
+fi
 
 sec "Versão marcada: SHA256SUMS"
 t "SHA256SUMS confere com os scripts (regenere: sha256sum baseline.sh baseline-verify.sh > SHA256SUMS)" sha256sum -c --quiet SHA256SUMS
