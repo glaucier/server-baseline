@@ -6,7 +6,7 @@
 # Lê /root/baseline.env (respostas da última execução, sem senha) — sem executá-lo.
 # =============================================================================
 set -uo pipefail
-VERIFY_VERSAO="2.2.1"      # a versão DESTE verify (BASELINE_VERSAO, no .env, é a de quem aplicou o padrão)
+VERIFY_VERSAO="2.2.2"      # a versão DESTE verify (BASELINE_VERSAO, no .env, é a de quem aplicou o padrão)
 PASS=0; FAIL=0; AVISO=0
 
 ENV_FILE=/root/baseline.env
@@ -336,6 +336,46 @@ snmpd_de_outro() {
   return 0
 }
 
+# ---- Agente do virtualizador (systemd-detect-virt): CÓPIA EXATA de baseline.sh (tests/run.sh confere que é idêntica) ----------
+# kvm|qemu -> qemu-guest-agent | vmware -> open-vm-tools | microsoft -> linux-cloud-tools-virtual (hv-kvp/hv-vss) | none ou outro -> nada
+VIRT_CANAL_QEMU=/dev/virtio-ports/org.qemu.guest_agent.0     # canal virtio que o Proxmox cria quando "QEMU Guest Agent" está marcado na VM
+virt_detectar() { local v; v=$(systemd-detect-virt 2>/dev/null) || true; echo "${v:-none}"; }   # o systemd-detect-virt imprime "none" e sai 1 em máquina física
+virt_pacote() { case $1 in kvm|qemu) echo qemu-guest-agent;; vmware) echo open-vm-tools;; microsoft) echo linux-cloud-tools-virtual;; esac; }
+virt_servicos() { case $1 in qemu-guest-agent) echo qemu-guest-agent;; open-vm-tools) echo open-vm-tools;; linux-cloud-tools-virtual) echo "hv-kvp-daemon hv-vss-daemon";; esac; }
+pkg_instalado() { [[ "$(dpkg-query -W -f='${Status}' "$1" 2>/dev/null)" == "install ok installed" ]]; }
+virt_canal_ok() { [[ -e "$VIRT_CANAL_QEMU" ]]; }
+# Unidade "static"/"indirect" não aceita `enable`: só `start` (o qemu-guest-agent sobe sozinho no boot, pelo udev, quando o canal virtio existe)
+virt_unidade_estatica() { case "$(systemctl is-enabled "$1" 2>/dev/null)" in static|indirect|generated|alias|transient) return 0;; *) return 1;; esac; }
+virt_aviso_canal="o canal virtio do agente ($VIRT_CANAL_QEMU) não existe nesta VM, então o qemu-guest-agent não sobe. No Proxmox: VM › Options › QEMU Guest Agent › marcar \"Enabled\" (Qemu Agent) e DESLIGAR e LIGAR a VM (reiniciar por dentro não cria o canal)"
+
+# Agente do virtualizador: OK se o pacote certo está instalado e o serviço ativo; AVISO (nunca FALHA) caso contrário, com o comando. none = máquina física.
+virt_confere() { # $1 = saída de systemd-detect-virt
+  local v=$1 pk sv inativos="" cmds=""
+  pk=$(virt_pacote "$v")
+  if [[ -z "$pk" ]]; then
+    if [[ "$v" == none ]]; then echo -e "  \e[32m[OK]\e[0m    Agente do virtualizador: máquina física (nada a conferir)"; PASS=$((PASS+1))
+    else inf "Agente do virtualizador: $v — sem agente mapeado pelo baseline (nada a conferir)"; fi
+    return 0
+  fi
+  if ! pkg_instalado "$pk"; then
+    echo -e "  \e[33m[AVISO]\e[0m Agente do virtualizador ($v): $pk NÃO instalado — sudo apt-get install -y $pk"; AVISO=$((AVISO+1)); return 0
+  fi
+  if [[ "$pk" == qemu-guest-agent ]] && ! virt_canal_ok; then
+    echo -e "  \e[33m[AVISO]\e[0m Agente do virtualizador ($v): $pk instalado, mas $virt_aviso_canal"; AVISO=$((AVISO+1)); return 0
+  fi
+  for sv in $(virt_servicos "$pk"); do
+    systemctl is-active --quiet "$sv" 2>/dev/null && continue
+    inativos+="${inativos:+ }$sv"
+    if virt_unidade_estatica "$sv"; then cmds+="${cmds:+ && }sudo systemctl start $sv"; else cmds+="${cmds:+ && }sudo systemctl enable --now $sv"; fi
+  done
+  if [[ -z "$inativos" ]]; then
+    echo -e "  \e[32m[OK]\e[0m    Agente do virtualizador ($v): $pk instalado e serviço ativo ($(virt_servicos "$pk"))"; PASS=$((PASS+1))
+  else
+    echo -e "  \e[33m[AVISO]\e[0m Agente do virtualizador ($v): $pk instalado, mas serviço inativo: $inativos — $cmds"; AVISO=$((AVISO+1))
+  fi
+  return 0
+}
+
 # --- Cabeçalho: a versão DESTE verify e a de quem aplicou o padrão ---
 verify_cabecalho() {
   echo "=============================================================="
@@ -504,6 +544,9 @@ esac
 if [[ "$(e PRO_ANEXAR)" == sim && "$PRO_E" != sim* ]]; then
   echo -e "  \e[33m[AVISO]\e[0m Ubuntu Pro foi pedido no baseline mas NÃO está anexado (sudo pro attach — token em https://ubuntu.com/pro)"; AVISO=$((AVISO+1))
 fi
+
+sec "Virtualizador"
+virt_confere "$(virt_detectar)"
 
 sec "Confirmação do baseline"
 PEND=$(compgen -G '/root/baseline-backup-*/PENDENTE' || true)

@@ -58,10 +58,10 @@ cenario() {
   ( source "$RAIZ/baseline.sh"; PATH="$ST:$PATH"; TS=teste; BK=$BKX; SSHD_ARQ=$SSH/10-baseline.conf; SSHD_ANTIGO=$SSH/10-g2-hardening.conf
     SNMPD_ARQ=$SNMPD; UFW_DEFAULT_ARQ=$V/default_ufw; UFW_ANTES=${UFW_ANT:-active}; SOCKET_ANTES=${SOCK:-disabled}; gerar_volta ) > "$BK/volta.sh"
   # ---- o baseline "aplica" ----
-  printf '# Gerado por baseline v2.2.1\nPort 44320\n' > "$SSH/10-baseline.conf"
+  printf '# Gerado por baseline v2.2.2\nPort 44320\n' > "$SSH/10-baseline.conf"
   sed -i '/# baseline:/d' "$U/rules"; echo "44320/tcp ALLOW IN 203.0.113.5 # baseline: SSH gestao" >> "$U/rules"
   echo deny > "$U/pol_incoming"; echo allow > "$U/pol_outgoing"; echo active > "$U/ativo"
-  if [[ "${SNMP_GER:-0}" == 1 ]]; then printf '# Gerado por baseline v2.2.1 — somente SNMPv3\nrouser x priv\n' > "$SNMPD"
+  if [[ "${SNMP_GER:-0}" == 1 ]]; then printf '# Gerado por baseline v2.2.2 — somente SNMPv3\nrouser x priv\n' > "$SNMPD"
   else printf '# snmpd.conf de OUTRO produto\n' > "$SNMPD"; fi
   # ---- DENTRO da janela de 5 min outros produtos mexem ----
   printf 'ClientAliveInterval 9\n# alterado dentro da janela\n' > "$SSH/01-outro.conf"
