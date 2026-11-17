@@ -20,7 +20,7 @@
 # =============================================================================
 set -uo pipefail
 
-VERSAO="2.2.1"
+VERSAO="2.2.2"
 ENV_FILE=/root/baseline.env
 ENV_ANTIGO=/root/g2-baseline.env          # v1 (g2-baseline): lido como padrão, nunca alterado
 TS=$(date +%Y%m%d-%H%M%S)
@@ -789,6 +789,43 @@ anexar_pro() {
   return "$rc"
 }
 
+# ---- Agente do virtualizador (systemd-detect-virt): CÓPIA EXATA em baseline-verify.sh (tests/run.sh confere que é idêntica) ----------
+# kvm|qemu -> qemu-guest-agent | vmware -> open-vm-tools | microsoft -> linux-cloud-tools-virtual (hv-kvp/hv-vss) | none ou outro -> nada
+VIRT_CANAL_QEMU=/dev/virtio-ports/org.qemu.guest_agent.0     # canal virtio que o Proxmox cria quando "QEMU Guest Agent" está marcado na VM
+virt_detectar() { local v; v=$(systemd-detect-virt 2>/dev/null) || true; echo "${v:-none}"; }   # o systemd-detect-virt imprime "none" e sai 1 em máquina física
+virt_pacote() { case $1 in kvm|qemu) echo qemu-guest-agent;; vmware) echo open-vm-tools;; microsoft) echo linux-cloud-tools-virtual;; esac; }
+virt_servicos() { case $1 in qemu-guest-agent) echo qemu-guest-agent;; open-vm-tools) echo open-vm-tools;; linux-cloud-tools-virtual) echo "hv-kvp-daemon hv-vss-daemon";; esac; }
+pkg_instalado() { [[ "$(dpkg-query -W -f='${Status}' "$1" 2>/dev/null)" == "install ok installed" ]]; }
+virt_canal_ok() { [[ -e "$VIRT_CANAL_QEMU" ]]; }
+# Unidade "static"/"indirect" não aceita `enable`: só `start` (o qemu-guest-agent sobe sozinho no boot, pelo udev, quando o canal virtio existe)
+virt_unidade_estatica() { case "$(systemctl is-enabled "$1" 2>/dev/null)" in static|indirect|generated|alias|transient) return 0;; *) return 1;; esac; }
+virt_aviso_canal="o canal virtio do agente ($VIRT_CANAL_QEMU) não existe nesta VM, então o qemu-guest-agent não sobe. No Proxmox: VM › Options › QEMU Guest Agent › marcar \"Enabled\" (Qemu Agent) e DESLIGAR e LIGAR a VM (reiniciar por dentro não cria o canal)"
+
+# Instala (só se faltar) e liga o agente do virtualizador. Nunca pergunta, nunca aborta o baseline: falha vira AVISO.
+virt_aplicar() { # $1 = saída de systemd-detect-virt
+  local v=$1 pk sv
+  pk=$(virt_pacote "$v")
+  if [[ -z "$pk" ]]; then
+    if [[ "$v" == none ]]; then ok "Virtualizador: máquina física — nenhum agente a instalar"
+    else ok "Virtualizador: $v — sem agente mapeado pelo baseline, nada a instalar"; fi
+    return 0
+  fi
+  echo "  Virtualizador detectado: $v → agente: $pk"
+  if pkg_instalado "$pk"; then ok "$pk já instalado"
+  elif apt-get "${APT_OPTS[@]}" install "$pk" >/dev/null; then ok "$pk instalado"
+  else aviso "Não consegui instalar $pk. O servidor segue sem o agente; instale depois: sudo apt-get install -y $pk"; return 0; fi
+  if [[ "$pk" == qemu-guest-agent ]] && ! virt_canal_ok; then
+    aviso "$pk instalado, mas $virt_aviso_canal. Depois confira: sudo baseline-verify"
+    return 0
+  fi
+  for sv in $(virt_servicos "$pk"); do
+    if virt_unidade_estatica "$sv"; then systemctl start "$sv" >/dev/null 2>&1       # static: sem enable (a mensagem "disabled or a static unit" não é erro)
+    else systemctl enable --now "$sv" >/dev/null 2>&1 || systemctl start "$sv" >/dev/null 2>&1; fi
+    if systemctl is-active --quiet "$sv"; then ok "Serviço $sv ativo"
+    else aviso "Serviço $sv não ficou ativo. Veja: systemctl status $sv   (o baseline-verify avisa)"; fi
+  done
+}
+
 # Permite `source baseline.sh` nos testes (tests/run.sh): só as funções, nada é executado
 [[ "${BASH_SOURCE[0]}" != "$0" ]] && return 0
 
@@ -1128,6 +1165,10 @@ if [[ "$DISCO_EXPANDIR" == sim ]]; then echo "  Disco ..............: expandir $
 elif [[ "$DISCO_EXPANDIR" == nao ]]; then echo "  Disco ..............: NÃO expandir ($(disco_gb "$DISCO_LIVRE") GB livres no grupo $DISCO_VG ficam sem uso)"
 else echo "  Disco ..............: nada a fazer (sem LVM na raiz ou sem espaço livre no grupo)"; fi
 echo "  Relógio ............: $RELOGIO_ESTADO (serviço: ${RELOGIO_SERVICO:-nenhum ativo})"
+VIRT=$(virt_detectar); VIRT_PKG=$(virt_pacote "$VIRT")
+if [[ -n "$VIRT_PKG" ]]; then echo "  Virtualizador ......: $VIRT → agente $VIRT_PKG ($(pkg_instalado "$VIRT_PKG" && echo 'já instalado' || echo 'será instalado'); sem pergunta, detectado)"
+elif [[ "$VIRT" == none ]]; then echo "  Virtualizador ......: nenhum (máquina física): sem agente"
+else echo "  Virtualizador ......: $VIRT (sem agente mapeado pelo baseline): nada a instalar"; fi
 [[ -n "$RELOGIO_AVISO" ]] && aviso "Relógio: $RELOGIO_AVISO"
 if [[ -n "$ATALHOS" ]]; then echo "  Atalhos de terminal : $ATALHOS   (todos os usuários, em $BASHRC_ARQ)"
 else echo "  Atalhos de terminal : nenhum (o bloco do baseline, se existir, será removido)"; fi
@@ -1199,6 +1240,7 @@ PKGS=(unattended-upgrades ufw openssh-client)
 [[ "$PRO_ANEXAR" == sim && "$PRO_JA" != sim ]] && PKGS+=(ubuntu-pro-client)
 apt-get "${APT_OPTS[@]}" install "${PKGS[@]}" >/dev/null || pare "Instalação de pacotes falhou"
 ok "Pacotes: ${PKGS[*]}"
+virt_aplicar "$VIRT"
 cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";

@@ -4,6 +4,21 @@ Formato: versão, data, o que mudou. Mudanças nas chaves do `/root/baseline.env
 "Contrato do baseline.env" no README) aparecem sempre na subseção **Contrato do baseline.env**: **renomear, remover ou
 mudar o formato de uma chave do contrato exige aviso aqui, na mesma versão.**
 
+## 2.2.2 — 2026-11-17
+
+### Novo
+- **Agente do virtualizador, detectado sozinho** (sem pergunta ao operador). O `baseline.sh` roda `systemd-detect-virt` (mostrado no resumo) e, na etapa 1, logo depois dos pacotes e antes do SSH/UFW, instala **só se faltar** (`dpkg-query`) e liga o serviço:
+  - `kvm`/`qemu` → `qemu-guest-agent` (unidade *static*: só `start`; sobe sozinha no boot pelo udev; a mensagem "disabled or a static unit" não é tratada como erro);
+  - `vmware` → `open-vm-tools`; `microsoft` → `linux-cloud-tools-virtual` (`hv-kvp-daemon`, `hv-vss-daemon`) com `systemctl enable --now`;
+  - `none` ou outro → nada, só informa.
+  - **KVM sem o canal virtio** (`/dev/virtio-ports/org.qemu.guest_agent.0`): o agente não sobe; o baseline instala, **avisa** para marcar "Qemu Agent" na VM do Proxmox (Options › QEMU Guest Agent) e **desligar/ligar** a VM, e segue. Falha de instalação ou de serviço também é só AVISO.
+- `baseline-verify`: item novo "agente do virtualizador" — **OK** se o pacote certo está instalado e o serviço ativo (`none` = "máquina física"); **AVISO, nunca FALHA**, caso contrário, com o comando para corrigir.
+- Testes com `systemd-detect-virt`, `dpkg-query`, `apt-get` e `systemctl` falsos: kvm, vmware, microsoft, none, outro, kvm sem canal, falha do apt, serviço que não sobe, e o bloco compartilhado idêntico nos dois scripts.
+- README: tabela virtualizador → pacote. `docs/release-v2.2.2.md`.
+
+### Contrato do baseline.env
+- Nenhuma chave alterada, renomeada ou removida (o virtualizador é detectado a cada execução e não é gravado).
+
 ## 2.2.1 — 2026-11-06
 
 ### Corrigido

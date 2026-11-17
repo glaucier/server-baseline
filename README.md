@@ -11,7 +11,7 @@ portas no UFW; o baseline só mexe nas regras marcadas `# baseline:`.
 
 | Etapa | O que aplica |
 |---|---|
-| 1. Sistema | **disco**: se o LV da raiz (LVM) é menor que o disco e sobra > 1 GB no grupo, oferece `lvextend -r -l +100%FREE`; **relógio**: confere `NTPSynchronized` e o serviço de hora (timesyncd ou chrony, **sem trocar um pelo outro**), esperando até 60 s; fuso horário, nome do servidor, `apt full-upgrade` (opcional), atualização automática diária **só de segurança, sem reboot automático**, no horário escolhido, com lista de pacotes que ela não toca (ex.: `unbound`); **atalhos de terminal** (alias) para todos os usuários (opcional); **Ubuntu Pro** (Livepatch/ESM, opcional) |
+| 1. Sistema | **disco**: se o LV da raiz (LVM) é menor que o disco e sobra > 1 GB no grupo, oferece `lvextend -r -l +100%FREE`; **relógio**: confere `NTPSynchronized` e o serviço de hora (timesyncd ou chrony, **sem trocar um pelo outro**), esperando até 60 s; fuso horário, nome do servidor, `apt full-upgrade` (opcional), atualização automática diária **só de segurança, sem reboot automático**, no horário escolhido, com lista de pacotes que ela não toca (ex.: `unbound`); **atalhos de terminal** (alias) para todos os usuários (opcional); **Ubuntu Pro** (Livepatch/ESM, opcional); **agente do virtualizador** detectado sozinho (`systemd-detect-virt`): `qemu-guest-agent` no Proxmox/KVM, `open-vm-tools` no VMware, `linux-cloud-tools-virtual` no Hyper-V; máquina física: nada |
 | 2. IPv6 | sugere o /64 sozinho (prefixo anunciado pelo roteador, ou o AAAA de um vizinho da mesma rede IPv4 — ex.: o servidor DNS configurado), confere com o bloco do provedor, sugere `<prefixo>::<último octeto>` e **testa antes do resumo**: duplicidade (DAD) e resposta do gateway. Grava `/etc/netplan/60-ipv6.yaml` e já ativa, sem reboot |
 | 3. SSH + UFW | porta própria, só chave, sem root; **AllowUsers** (padrão: só o administrador), **AllowTcpForwarding no**, **AllowAgentForwarding no**, `LoginGraceTime 30`, `ClientAliveInterval 300`, `ClientAliveCountMax 2` (cada um é perguntado); UFW nega a entrada e libera o SSH só para as redes de gestão. **Volta automática**: se o novo acesso não for confirmado em 5 minutos, o baseline desfaz **só o que gravou** (SSH e UFW voltam ao que eram; arquivos e regras de outros produtos não são tocados) |
 | 4. SNMPv3 | somente leitura, `authPriv` (SHA-256/AES), sem community; porta 161 só para o monitoramento |
@@ -32,9 +32,9 @@ No servidor, baixe uma **versão marcada** (nunca a `main`), confira o SHA256 pu
 
 ```bash
 cd /tmp
-curl -fsSLO https://raw.githubusercontent.com/glaucier/server-baseline/v2.2.1/baseline.sh
-curl -fsSLO https://raw.githubusercontent.com/glaucier/server-baseline/v2.2.1/baseline-verify.sh
-curl -fsSLO https://raw.githubusercontent.com/glaucier/server-baseline/v2.2.1/SHA256SUMS
+curl -fsSLO https://raw.githubusercontent.com/glaucier/server-baseline/v2.2.2/baseline.sh
+curl -fsSLO https://raw.githubusercontent.com/glaucier/server-baseline/v2.2.2/baseline-verify.sh
+curl -fsSLO https://raw.githubusercontent.com/glaucier/server-baseline/v2.2.2/SHA256SUMS
 sha256sum -c SHA256SUMS                       # os dois têm de dar "OK"; compare também com a página da versão (Releases)
 sudo bash baseline.sh
 ```
@@ -119,12 +119,26 @@ Tudo aparece no **RESUMO** antes de "Aplicar?" e é conferido pelo `baseline-ver
 | Atalhos de terminal (alias) para TODOS os usuários, inclusive root | `ATALHOS` | `r=reset` | `nome=comando`, vários separados por espaço (o comando pode ter espaços: `r=reset ll=ls -la`); nome `[a-z][a-z0-9_-]*`; proibidos no comando `; \| & \` $ ( ) < >`, barra invertida e aspas; `nenhum` remove tudo. Grava **um bloco** entre `# baseline: atalhos (início)` e `# baseline: atalhos (fim)` em `/etc/bash.bashrc`, **reescrito por inteiro** a cada execução (rodar 2× não duplica). Nunca edita `~/.bashrc` de usuário. Só vale em shells interativos do bash. `baseline-verify`: o bloco bate com o `.env` e `bash -ic 'alias r'` responde como root e como o administrador |
 | Anexar ao Ubuntu Pro (Livepatch, ESM)? | `PRO_ANEXAR` | `nao` | token de https://ubuntu.com/pro digitado **sem eco**, passado ao `pro attach --attach-config` por **arquivo temporário 0600** (pasta 0700, apagado no fim e no `trap`); **nunca** em argumento, log, resumo nem `baseline.env` (o resumo só diz "anexar: sim"). Já anexado: pula. `baseline-verify`: informa o estado (`pro status --format json`) e dá AVISO só se o `.env` pediu e não está anexado |
 
+## Agente do virtualizador (detectado sozinho)
+
+Sem pergunta: o baseline roda `systemd-detect-virt`, mostra no resumo o que detectou e, na etapa 1, instala **só se faltar** (`dpkg-query`) e liga o serviço. Sem o agente o hipervisor não consegue congelar o disco no snapshot, pedir desligamento limpo nem mostrar o IP da VM (no Proxmox: "agent configured but not running").
+
+| `systemd-detect-virt` | Pacote | Serviço(s) | Observação |
+|---|---|---|---|
+| `kvm`, `qemu` (Proxmox) | `qemu-guest-agent` | `qemu-guest-agent` | a unidade é *static*: o baseline faz só `start` (sem `enable`; a mensagem "disabled or a static unit" não é erro) e ela sobe sozinha a cada boot pelo udev. **Precisa do canal virtio** (`/dev/virtio-ports/org.qemu.guest_agent.0`): sem ele o baseline instala, **avisa** e não tenta subir. Correção: na VM do Proxmox, **Options › QEMU Guest Agent › Enabled** e **desligar e ligar** a VM (reiniciar por dentro não cria o canal) |
+| `vmware` (ESXi) | `open-vm-tools` | `open-vm-tools` | `enable --now` |
+| `microsoft` (Hyper-V) | `linux-cloud-tools-virtual` | `hv-kvp-daemon`, `hv-vss-daemon` | `enable --now` (ou só `start`, se a unidade for static) |
+| `none` (máquina física) | — | — | só informa |
+| outro (`oracle`, `xen`, contêiner…) | — | — | só informa; o baseline não escolhe agente |
+
+Falha ao instalar ou ao subir o serviço é **AVISO**, nunca aborta o baseline. `baseline-verify` (seção "Virtualizador"): **OK** se o pacote certo está instalado e o serviço ativo (em `none`: "máquina física"); caso contrário **AVISO** (nunca FALHA) com o comando para corrigir.
+
 ## Se o baseline parar ("Abortado")
 
 O `baseline-verify` só é instalado em `/usr/local/sbin` no **fim** (etapa 4/4). Se a execução para antes (conflito de SSH, autoteste…), o
 `sudo baseline-verify` instalado ainda é o da **versão anterior**. Por isso toda mensagem "Abortado" termina com
 `Para conferir com a versão nova: sudo bash <pasta do script>/baseline-verify.sh`. O verify também imprime a **sua própria versão**
-no cabeçalho (`baseline-verify v2.2.1`) separada da versão que aplicou o padrão (`padrão aplicado pela v…`).
+no cabeçalho (`baseline-verify v2.2.2`) separada da versão que aplicou o padrão (`padrão aplicado pela v…`).
 
 ## SNMP: snmpd.conf de outro produto e teste real
 
@@ -198,7 +212,7 @@ não perguntar de novo). Formato: uma `CHAVE="valor"` por linha, **sem senha nem
 
 | Chave | Conteúdo | Exemplo | Desde |
 |---|---|---|---|
-| `BASELINE_VERSAO` | versão do baseline que gravou o arquivo | `2.2.1` | 2.0.0 |
+| `BASELINE_VERSAO` | versão do baseline que gravou o arquivo | `2.2.2` | 2.0.0 |
 | `ADMIN_USER` | usuário administrador (único com sudo/SSH garantido) | `admin` | 2.0.0 |
 | `SSH_PORT` | porta do SSH | `44320` | 2.0.0 |
 | `GESTAO_SSH` | IPs/redes autorizados a acessar o SSH (origens de gestão) | `192.0.2.10 198.51.100.0/24` | 2.0.0 |

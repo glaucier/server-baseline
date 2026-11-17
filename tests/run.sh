@@ -22,7 +22,7 @@ no_verify()   { local c=$1; shift; CODIGO=$c bash -c 'set -uo pipefail; source "
 sec "Sintaxe e política"
 t "bash -n baseline.sh"        bash -n baseline.sh
 t "bash -n baseline-verify.sh" bash -n baseline-verify.sh
-t "versão 2.2.1 no baseline.sh"  grep -q '^VERSAO="2.2.1"' baseline.sh
+t "versão 2.2.2 no baseline.sh"  grep -q '^VERSAO="2.2.2"' baseline.sh
 t "nunca \`source\` de arquivo de respostas/env (só leitura chave=valor)" bash -c '! grep -nE "^[[:space:]]*(source|\.)[[:space:]]+(\"?\$(ARQ_RESP|ENV_FILE|ENV_ANTIGO)|/root/)" baseline.sh baseline-verify.sh'
 t "log nasce 600 (install) ANTES do exec/tee" bash -c '
   a=$(grep -n "install -m 600 -o root -g root /dev/null \"\$LOG\"" baseline.sh | head -1 | cut -d: -f1)
@@ -105,7 +105,7 @@ t "so_root: 644 é recusado"          bash -c 'source "$1"; ! so_root "$2"' _ "$
 
 sec "/root/baseline.env: sem senha, 600, chaves novas"
 t "salvar_env grava as chaves novas, nenhuma senha, modo 600" no_baseline "
-  ENV_FILE=\"$TMP/b.env\"; VERSAO=2.2.1; $PREPARA; AUTH='SenhaAuth123'; PRIV='SenhaPriv456'; SENHA='SenhaX789'; PRO_TOKEN='TokenPro1234567890'; DISCO_EXPANDIR=sim; ATALHOS='r=reset'; PRO_ANEXAR=sim; SNMP_USER=u; salvar_env
+  ENV_FILE=\"$TMP/b.env\"; VERSAO=2.2.2; $PREPARA; AUTH='SenhaAuth123'; PRIV='SenhaPriv456'; SENHA='SenhaX789'; PRO_TOKEN='TokenPro1234567890'; DISCO_EXPANDIR=sim; ATALHOS='r=reset'; PRO_ANEXAR=sim; SNMP_USER=u; salvar_env
   [[ \$(stat -c %a \"\$ENV_FILE\") == 600 ]] && grep -qx 'SSH_USUARIOS=\"admin backup\"' \"\$ENV_FILE\" && grep -qx 'SSH_TCP_FWD=\"nao\"' \"\$ENV_FILE\" &&
   grep -qx 'SSH_AGENT_FWD=\"nao\"' \"\$ENV_FILE\" && grep -qx 'SSH_GRACE=\"30\"' \"\$ENV_FILE\" && grep -qx 'SSH_ALIVE_INT=\"300\"' \"\$ENV_FILE\" && grep -qx 'SSH_ALIVE_MAX=\"2\"' \"\$ENV_FILE\" &&
   ! grep -qE 'SenhaAuth123|SenhaPriv456|SenhaX789|TokenPro1234567890|AUTH|PRIV|SENHA|TOKEN' \"\$ENV_FILE\" && grep -qx 'DISCO_EXPANDIR=\"sim\"' \"\$ENV_FILE\" && grep -qx 'ATALHOS=\"r=reset\"' \"\$ENV_FILE\" && grep -qx 'PRO_ANEXAR=\"sim\"' \"\$ENV_FILE\""
@@ -302,9 +302,9 @@ t "arquivo de respostas: PRO_ANEXAR=sim entra; token NÃO é chave do arquivo" n
 
 sec "Contrato do baseline.env (chaves que outros produtos leem)"
 CONTRATO="BASELINE_VERSAO ADMIN_USER SSH_PORT GESTAO_SSH SSH_USUARIOS SNMP SNMP_ORIGENS SNMP_USER SNMP_LOCATION SNMP_CONTACT"
-t "salvar_env grava todas as chaves do contrato"         no_baseline "ENV_FILE=\"$TMP/c.env\"; VERSAO=2.2.1; salvar_env; for k in $CONTRATO; do grep -q \"^\${k}=\" \"\$ENV_FILE\" || { echo \"falta \$k\"; exit 1; }; done"
+t "salvar_env grava todas as chaves do contrato"         no_baseline "ENV_FILE=\"$TMP/c.env\"; VERSAO=2.2.2; salvar_env; for k in $CONTRATO; do grep -q \"^\${k}=\" \"\$ENV_FILE\" || { echo \"falta \$k\"; exit 1; }; done"
 t "README documenta cada chave do contrato"              bash -c 'sed -n "/Contrato do baseline.env/,\$p" README.md > "$2"; for k in $1; do grep -q "\`$k\`" "$2" || { echo "README sem $k"; exit 1; }; done' _ "$CONTRATO" "$TMP/contrato.md"
-t "CHANGELOG.md existe e registra a 2.2.1"                bash -c 'grep -q "2.2.1" CHANGELOG.md && grep -qi "renomear\|renomeada\|renomeação" CHANGELOG.md'
+t "CHANGELOG.md existe e registra a 2.2.2"                bash -c 'grep -q "2.2.2" CHANGELOG.md && grep -qi "renomear\|renomeada\|renomeação" CHANGELOG.md'
 t "nenhum rename silencioso: chaves do contrato continuam no código" bash -c 'for k in SSH_PORT GESTAO_SSH SSH_USUARIOS SNMP_ORIGENS SNMP_USER SNMP_LOCATION SNMP_CONTACT; do grep -q "\b$k\b" baseline.sh || exit 1; done'
 
 
@@ -472,7 +472,7 @@ fi
 sec "2) Abortado: a versão nova do verify; o verify imprime a PRÓPRIA versão"
 t "pare: aponta para o baseline-verify.sh ao lado do script"  bash -c 'out=$(source ./baseline.sh; LOG=/x; pare "teste" 2>&1); rc=$?; [[ $rc -ne 0 && "$out" == *"Abortado."* && "$out" == *"Para conferir com a versão nova: sudo bash '"$RAIZ"'/baseline-verify.sh"* ]]'
 mkdir -p "$TMP/sozinho"; cp baseline.sh "$TMP/sozinho/"
-t "pare: sem baseline-verify.sh ao lado, manda baixar o da mesma versão" bash -c 'out=$(source "$1"; LOG=/x; pare "teste" 2>&1); [[ "$out" == *"baixe o baseline-verify.sh da v2.2.1"* && "$out" == *"o '"'"'sudo baseline-verify'"'"' instalado pode ser o da versão anterior"* ]]' _ "$TMP/sozinho/baseline.sh"
+t "pare: sem baseline-verify.sh ao lado, manda baixar o da mesma versão" bash -c 'out=$(source "$1"; LOG=/x; pare "teste" 2>&1); [[ "$out" == *"baixe o baseline-verify.sh da v2.2.2"* && "$out" == *"o '"'"'sudo baseline-verify'"'"' instalado pode ser o da versão anterior"* ]]' _ "$TMP/sozinho/baseline.sh"
 t "toda mensagem 'Abortado' sai pelo pare (um único lugar)"      bash -c '[[ $(grep -c "Abortado" baseline.sh) == 1 ]] && grep -n "Abortado" baseline.sh | grep -q "echo \"Abortado. Log"'
 t "conflito de SSH e autoteste abortam via pare"                  bash -c 'grep -q "pare \"Nada foi alterado (conflito de SSH" baseline.sh && grep -q "pare \"Autoteste do SSH falhou" baseline.sh'
 t "verify imprime a SUA versão e a de quem aplicou o padrão"      bash -c 'source ./baseline-verify.sh; declare -A E=([BASELINE_VERSAO]=2.1.0); out=$(verify_cabecalho); [[ "$out" == *"baseline-verify v$VERIFY_VERSAO "* && "$out" == *"padrão aplicado pela v2.1.0"* ]]'
@@ -517,7 +517,7 @@ t "snmpd_de_outro: conffile do pacote MODIFICADO (md5 diferente) → é de outro
 
 cp "$TMP/snmpd.outro" "$TMP/snmpd.intocado"
 t "baseline.sh NÃO sobrescreve o snmpd.conf de outro produto (conteúdo idêntico, retorno 1)" no_baseline 'SNMPD_ARQ=$1; SNMPD_OUTRO=sim; V4=1.2.3.4; SNMP_LOCATION=X; SNMP_CONTACT=y; SNMP_USER=u; ! snmpd_gravar_conf && cmp -s "$1" "$2"' "$TMP/snmpd.intocado" "$TMP/snmpd.outro"
-t "...e grava o do baseline (com a marca) quando não é de outro"   no_baseline 'SNMPD_ARQ=$1; SNMPD_OUTRO=nao; V4=1.2.3.4; SNMP_LOCATION=Sala; SNMP_CONTACT=y; SNMP_USER=monitorv3; snmpd_gravar_conf && head -1 "$1" | grep -q "^# Gerado por baseline v2.2.1" && grep -qx "rouser monitorv3 priv" "$1"' "$TMP/snmpd.novo"
+t "...e grava o do baseline (com a marca) quando não é de outro"   no_baseline 'SNMPD_ARQ=$1; SNMPD_OUTRO=nao; V4=1.2.3.4; SNMP_LOCATION=Sala; SNMP_CONTACT=y; SNMP_USER=monitorv3; snmpd_gravar_conf && head -1 "$1" | grep -q "^# Gerado por baseline v2.2.2" && grep -qx "rouser monitorv3 priv" "$1"' "$TMP/snmpd.novo"
 t "resumo: 'snmpd.conf de outro produto — mantido; só o usuário SNMPv3 é conferido'" bash -c 'sed -n "/RESUMO — nada foi alterado/,/read -rp \"Aplicar/p" baseline.sh | grep -q "snmpd.conf de outro produto — mantido; só o usuário SNMPv3 é conferido"'
 t "com snmpd.conf de outro produto o baseline NÃO pede as senhas"  bash -c '
   a=$(grep -n "if \[\[ \"\$SNMPD_OUTRO\" == sim \]\]; then" baseline.sh | head -1 | cut -d: -f1)
@@ -605,14 +605,148 @@ t "(a) nunca o conteúdo digitado"                                  bash -c '! g
 t "(a) Enter vazio pula: '(digitado: 0 caracteres)'"               bash -c 'source "$1"; printf "\n" | { ler_oculto "Senha: " A; } 2>&1 >/dev/null | grep -qx "  (digitado: 0 caracteres)"' _ "$RAIZ/baseline-verify.sh"
 t "(a) o verify usa ler_oculto para as duas senhas e o teste nos dois endereços" bash -c 'grep -q "ler_oculto \"Senha de AUTENTICAÇÃO (Enter pula): \" A" baseline-verify.sh && grep -q "ler_oculto \"Senha de CRIPTOGRAFIA: \" P" baseline-verify.sh && grep -q "snmp_confere_real \"\$SU\" \"\$A\" \"\$P\" \"\$V4\"" baseline-verify.sh'
 
+sec "Agente do virtualizador (systemd-detect-virt, dpkg-query, apt-get e systemctl falsos)"
+SV="$TMP/sv"; mkdir -p "$SV"
+cat > "$SV/systemd-detect-virt" <<'EOT'
+#!/usr/bin/env bash
+echo "${STUB_VIRT:-none}"; [[ "${STUB_VIRT:-none}" != none ]]
+EOT
+cat > "$SV/dpkg-query" <<'EOT'
+#!/usr/bin/env bash
+last=""; for a in "$@"; do last=$a; done
+grep -qxF -- "$last" "$STUB_PKGS" 2>/dev/null && printf 'install ok installed'
+EOT
+cat > "$SV/apt-get" <<'EOT'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$STUB_APT"
+[[ "${STUB_APT_FAIL:-0}" == 1 ]] && exit 100
+last=""; for a in "$@"; do last=$a; done; echo "$last" >> "$STUB_PKGS"
+EOT
+cat > "$SV/systemctl" <<'EOT'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$STUB_SC"
+u=""; for a in "$@"; do u=$a; done
+case $1 in
+  is-enabled) echo "${STUB_ENABLED:-disabled}"; [[ "${STUB_ENABLED:-disabled}" =~ ^(enabled|static)$ ]];;
+  is-active)  grep -qxF -- "$u" "$STUB_ATIVOS" 2>/dev/null;;
+  start)      [[ "${STUB_NOSTART:-0}" == 1 ]] || echo "$u" >> "$STUB_ATIVOS";;
+  enable)     if [[ "${STUB_ENABLED:-disabled}" == static ]]; then echo "The unit files have no installation config (WantedBy=, RequiredBy=, ...): disabled or a static unit" >&2; exit 1; fi
+              [[ "${STUB_NOSTART:-0}" == 1 ]] || echo "$u" >> "$STUB_ATIVOS";;
+esac
+EOT
+chmod +x "$SV"/*
+export STUB_PKGS="$TMP/v.pkgs" STUB_APT="$TMP/v.apt" STUB_SC="$TMP/v.sc" STUB_ATIVOS="$TMP/v.ativos" CANAL_FAKE="$TMP/v.canal"
+# vz SCRIPT VIRT "pacotes instalados" "serviços ativos" ENABLED canal(sim|nao) CÓDIGO — roda com os stubs; saída em $TMP/v.out (última linha: CONTADORES pass fail aviso)
+vz() {
+  local script=$1 virt=$2 pkgs=$3 ativos=$4 enabled=$5 canal=$6 codigo=$7
+  : > "$STUB_APT"; : > "$STUB_SC"; printf '%s\n' $pkgs > "$STUB_PKGS"; printf '%s\n' $ativos > "$STUB_ATIVOS"
+  rm -f "$CANAL_FAKE"; [[ "$canal" == sim ]] && : > "$CANAL_FAKE"
+  env PATH="$SV:$PATH" STUB_VIRT="$virt" STUB_ENABLED="$enabled" CODIGO="$codigo" bash -c '
+    source "$1"; VIRT_CANAL_QEMU=$CANAL_FAKE; virt_aviso_canal=${virt_aviso_canal//\/dev\/virtio-ports\/org.qemu.guest_agent.0/$VIRT_CANAL_QEMU}
+    APT_OPTS=(-y); PASS=0; FAIL=0; AVISO=0; eval "$CODIGO"; rc=$?; echo "CONTADORES $PASS $FAIL $AVISO"; exit $rc' _ "$script" > "$TMP/v.out" 2>&1
+  VZ_RC=$?
+}
+V_B="$RAIZ/baseline.sh"; V_V="$RAIZ/baseline-verify.sh"
+sai()  { grep -qF -- "$1" "$TMP/v.out"; }          # a saída contém o texto
+nsai() { ! grep -qF -- "$1" "$TMP/v.out"; }
+sc()   { grep -qxF -- "$1" "$STUB_SC"; }           # chamada exata ao systemctl
+nsc()  { ! grep -qxF -- "$1" "$STUB_SC"; }
+apt_chamado() { [[ -s "$STUB_APT" ]]; }
+nada_chamado() { [[ ! -s "$STUB_APT" && ! -s "$STUB_SC" ]]; }
+
+t "virt_detectar: kvm / vmware / microsoft / none (o systemd-detect-virt sai 1 em none)" env PATH="$SV:$PATH" bash -c 'source "$1"; for v in kvm vmware microsoft none; do export STUB_VIRT=$v; [[ $(virt_detectar) == $v ]] || exit 1; done' _ "$V_B"
+mkdir -p "$TMP/vazio"
+t "virt_detectar: sem o comando → none" env PATH="$TMP/vazio" /bin/bash -c 'source "$1"; [[ $(virt_detectar) == none ]]' _ "$V_B"
+t "mapa: kvm e qemu → qemu-guest-agent; vmware → open-vm-tools; microsoft → linux-cloud-tools-virtual; none/outros → nada" bash -c 'source "$1"; [[ $(virt_pacote kvm) == qemu-guest-agent && $(virt_pacote qemu) == qemu-guest-agent && $(virt_pacote vmware) == open-vm-tools && $(virt_pacote microsoft) == linux-cloud-tools-virtual && -z $(virt_pacote none) && -z $(virt_pacote xen) && -z $(virt_pacote docker) && -z $(virt_pacote oracle) ]]' _ "$V_B"
+t "mapa de serviços: Hyper-V → hv-kvp-daemon e hv-vss-daemon" bash -c 'source "$1"; [[ $(virt_servicos linux-cloud-tools-virtual) == "hv-kvp-daemon hv-vss-daemon" && $(virt_servicos open-vm-tools) == open-vm-tools && $(virt_servicos qemu-guest-agent) == qemu-guest-agent ]]' _ "$V_B"
+t "verify: bloco do virtualizador é cópia exata do baseline.sh" bash -c '
+  f="virt_detectar virt_pacote virt_servicos pkg_instalado virt_canal_ok virt_unidade_estatica"
+  a=$(source ./baseline.sh; declare -f $f; echo "$VIRT_CANAL_QEMU|$virt_aviso_canal")
+  b=$(source ./baseline-verify.sh; declare -f $f; echo "$VIRT_CANAL_QEMU|$virt_aviso_canal")
+  [[ -n $a && "$a" == "$b" ]]'
+
+# ---- baseline.sh: virt_aplicar ----
+vz "$V_B" kvm "" "" static sim "virt_aplicar kvm"
+t "kvm: instala o qemu-guest-agent (faltava)"                       apt_chamado
+t "kvm: apt-get install qemu-guest-agent"                           grep -qx -- "-y install qemu-guest-agent" "$STUB_APT"
+t "kvm: diz o que detectou e o que fez"                             bash -c 'grep -qF "Virtualizador detectado: kvm → agente: qemu-guest-agent" "$1" && grep -qF "qemu-guest-agent instalado" "$1"' _ "$TMP/v.out"
+t "kvm: unidade static → só start, NUNCA enable"                    bash -c 'grep -qx "start qemu-guest-agent" "$1" && ! grep -q "^enable" "$1"' _ "$STUB_SC"
+t "kvm: a mensagem de unidade static não aparece nem vira erro"     bash -c '! grep -qiE "static unit|AVISO|ERRO" "$1" && grep -qF "Serviço qemu-guest-agent ativo" "$1"' _ "$TMP/v.out"
+t "kvm: retorno 0"                                                  test "$VZ_RC" = 0
+
+vz "$V_B" qemu "qemu-guest-agent" "" static sim "virt_aplicar qemu"
+t "qemu (sem KVM) também usa o qemu-guest-agent"                    sai "Virtualizador detectado: qemu → agente: qemu-guest-agent"
+t "pacote já instalado → apt-get NÃO é chamado"                     bash -c '[[ ! -s "$1" ]] && grep -qF "qemu-guest-agent já instalado" "$2"' _ "$STUB_APT" "$TMP/v.out"
+
+vz "$V_B" kvm "" "" static nao "virt_aplicar kvm"
+t "kvm SEM canal virtio: instala mas AVISA (Options › QEMU Guest Agent, desligar e ligar a VM)" bash -c 'grep -qF "[AVISO]" "$1" && grep -qF "VM › Options › QEMU Guest Agent" "$1" && grep -qF "Qemu Agent" "$1" && grep -qF "DESLIGAR e LIGAR a VM" "$1"' _ "$TMP/v.out"
+t "kvm SEM canal: não tenta subir o serviço (a condição do udev não deixa)" bash -c '[[ ! -s "$1" ]] && grep -q "install qemu-guest-agent" "$2"' _ "$STUB_SC" "$STUB_APT"
+t "kvm SEM canal: não aborta o baseline (retorno 0)"                test "$VZ_RC" = 0
+t "kvm SEM canal: o AVISO cita o canal que faltou"                  sai "não existe nesta VM"
+
+vz "$V_B" vmware "" "" disabled nao "virt_aplicar vmware"
+t "vmware: instala open-vm-tools"                                   grep -qx -- "-y install open-vm-tools" "$STUB_APT"
+t "vmware: systemctl enable --now open-vm-tools (serviço permite)"  sc "enable --now open-vm-tools"
+t "vmware: não exige o canal do Proxmox"                            bash -c '! grep -qF "[AVISO]" "$1" && grep -qF "Serviço open-vm-tools ativo" "$1"' _ "$TMP/v.out"
+
+vz "$V_B" microsoft "" "" disabled nao "virt_aplicar microsoft"
+t "microsoft: instala linux-cloud-tools-virtual"                    grep -qx -- "-y install linux-cloud-tools-virtual" "$STUB_APT"
+t "microsoft: liga hv-kvp-daemon e hv-vss-daemon"                   bash -c 'grep -qx "enable --now hv-kvp-daemon" "$1" && grep -qx "enable --now hv-vss-daemon" "$1"' _ "$STUB_SC"
+t "microsoft: ambos ativos na saída"                                bash -c 'grep -qF "Serviço hv-kvp-daemon ativo" "$1" && grep -qF "Serviço hv-vss-daemon ativo" "$1"' _ "$TMP/v.out"
+
+vz "$V_B" none "" "" disabled nao "virt_aplicar none"
+t "none: máquina física, nada instalado nem ligado, só informa"     bash -c 'grep -qF "máquina física" "$1" && [[ ! -s "$2" && ! -s "$3" ]] && ! grep -qF "[AVISO]" "$1"' _ "$TMP/v.out" "$STUB_APT" "$STUB_SC"
+vz "$V_B" oracle "" "" disabled nao "virt_aplicar oracle"
+t "outro virtualizador (oracle): nada a instalar, só informa"       bash -c 'grep -qF "oracle — sem agente mapeado" "$1" && [[ ! -s "$2" && ! -s "$3" ]]' _ "$TMP/v.out" "$STUB_APT" "$STUB_SC"
+
+export STUB_APT_FAIL=1
+vz "$V_B" vmware "" "" disabled nao "virt_aplicar vmware"
+unset STUB_APT_FAIL
+t "apt falhou: AVISO com o comando, retorno 0 (o baseline segue)"   bash -c 'grep -qF "[AVISO]" "$1" && grep -qF "sudo apt-get install -y open-vm-tools" "$1" && [[ "$2" == 0 ]]' _ "$TMP/v.out" "$VZ_RC"
+
+export STUB_NOSTART=1
+vz "$V_B" vmware "open-vm-tools" "" disabled nao "virt_aplicar vmware"
+unset STUB_NOSTART
+t "serviço que não sobe: AVISO (não aborta)"                        bash -c 'grep -qF "[AVISO]" "$1" && grep -qF "Serviço open-vm-tools não ficou ativo" "$1" && [[ "$2" == 0 ]]' _ "$TMP/v.out" "$VZ_RC"
+
+t "política: virt_aplicar roda depois dos pacotes e ANTES do SSH/UFW" bash -c '
+  a=$(grep -n "^ok \"Pacotes:" baseline.sh | cut -d: -f1); b=$(grep -n "^virt_aplicar \"\$VIRT\"" baseline.sh | cut -d: -f1); c=$(grep -n "^info \"3/4 SSH e firewall\"" baseline.sh | cut -d: -f1)
+  [[ -n $a && -n $b && -n $c && $a -lt $b && $b -lt $c ]]'
+t "política: a detecção aparece no resumo, antes de \"Aplicar?\"" bash -c 'a=$(grep -n "^VIRT=\$(virt_detectar)" baseline.sh | cut -d: -f1); b=$(grep -n "read -rp \"Aplicar" baseline.sh | cut -d: -f1); [[ -n $a && -n $b && $a -lt $b ]]'
+t "política: sem pergunta ao operador (nenhum pergunta/read para o virtualizador)" bash -c '! grep -nE "pergunta VIRT|read[^#]*VIRT" baseline.sh'
+
+# ---- baseline-verify.sh: virt_confere (AVISO, nunca FALHA) ----
+vz "$V_V" kvm "qemu-guest-agent" "qemu-guest-agent" static sim "virt_confere kvm"
+t "verify kvm: pacote + serviço ativo + canal → OK"                 bash -c 'grep -qF "[OK]" "$1" && grep -qF "qemu-guest-agent instalado e serviço ativo" "$1" && grep -qx "CONTADORES 1 0 0" "$1"' _ "$TMP/v.out"
+vz "$V_V" kvm "" "" static sim "virt_confere kvm"
+t "verify kvm: pacote ausente → AVISO com o comando, nunca FALHA"   bash -c 'grep -qF "[AVISO]" "$1" && grep -qF "sudo apt-get install -y qemu-guest-agent" "$1" && grep -qx "CONTADORES 0 0 1" "$1"' _ "$TMP/v.out"
+vz "$V_V" kvm "qemu-guest-agent" "" static nao "virt_confere kvm"
+t "verify kvm sem canal: AVISO manda marcar o Qemu Agent no Proxmox e desligar/ligar" bash -c 'grep -qF "[AVISO]" "$1" && grep -qF "Options › QEMU Guest Agent" "$1" && grep -qF "DESLIGAR e LIGAR a VM" "$1" && grep -qx "CONTADORES 0 0 1" "$1"' _ "$TMP/v.out"
+vz "$V_V" kvm "qemu-guest-agent" "" static sim "virt_confere kvm"
+t "verify kvm: serviço inativo (static) → AVISO com 'systemctl start'" bash -c 'grep -qF "sudo systemctl start qemu-guest-agent" "$1" && ! grep -qF "enable --now" "$1" && grep -qx "CONTADORES 0 0 1" "$1"' _ "$TMP/v.out"
+vz "$V_V" vmware "open-vm-tools" "" enabled nao "virt_confere vmware"
+t "verify vmware: serviço inativo → AVISO com 'enable --now'"       bash -c 'grep -qF "sudo systemctl enable --now open-vm-tools" "$1" && grep -qx "CONTADORES 0 0 1" "$1"' _ "$TMP/v.out"
+vz "$V_V" vmware "open-vm-tools" "open-vm-tools" enabled nao "virt_confere vmware"
+t "verify vmware: pacote + serviço ativo → OK (sem exigir canal do Proxmox)" bash -c 'grep -qx "CONTADORES 1 0 0" "$1"' _ "$TMP/v.out"
+vz "$V_V" microsoft "linux-cloud-tools-virtual" "hv-kvp-daemon hv-vss-daemon" static nao "virt_confere microsoft"
+t "verify microsoft: pacote + os dois daemons ativos → OK"          bash -c 'grep -qx "CONTADORES 1 0 0" "$1"' _ "$TMP/v.out"
+vz "$V_V" microsoft "linux-cloud-tools-virtual" "hv-kvp-daemon" static nao "virt_confere microsoft"
+t "verify microsoft: hv-vss-daemon parado → AVISO"                  bash -c 'grep -qF "serviço inativo: hv-vss-daemon" "$1" && grep -qx "CONTADORES 0 0 1" "$1"' _ "$TMP/v.out"
+vz "$V_V" none "" "" disabled nao "virt_confere none"
+t "verify none: OK \"máquina física\""                              bash -c 'grep -qF "[OK]" "$1" && grep -qF "máquina física" "$1" && grep -qx "CONTADORES 1 0 0" "$1"' _ "$TMP/v.out"
+vz "$V_V" oracle "" "" disabled nao "virt_confere oracle"
+t "verify outro virtualizador: só informa (nem OK, nem AVISO, nem FALHA)" bash -c 'grep -qF "[INFO]" "$1" && grep -qx "CONTADORES 0 0 0" "$1"' _ "$TMP/v.out"
+t "verify: o item nunca incrementa FALHA"                           bash -c 'sed -n "/^virt_confere()/,/^}/p" baseline-verify.sh | grep -qE "FAIL|chk " && exit 1; exit 0'
+t "verify: seção Virtualizador chama virt_confere com a detecção"   bash -c 'grep -q "^sec \"Virtualizador\"" baseline-verify.sh && grep -q "^virt_confere \"\$(virt_detectar)\"" baseline-verify.sh'
+
 sec "volta.sh: restaura SÓ o que o baseline grava (tests/volta.sh)"
 N=$((N+1))
 if bash tests/volta.sh; then echo "  ok    volta.sh restaura só os arquivos/regras do baseline"; else echo "  FALHA volta.sh"; FALHAS=$((FALHAS+1)); fi
 
 sec "Versão marcada: SHA256SUMS"
 t "SHA256SUMS confere com os scripts (regenere: sha256sum baseline.sh baseline-verify.sh > SHA256SUMS)" sha256sum -c --quiet SHA256SUMS
-t "texto da release traz os dois sha256" bash -c 'for f in baseline.sh baseline-verify.sh; do h=$(sha256sum "$f" | cut -d" " -f1); grep -q "$h" docs/release-v2.2.1.md || exit 1; done'
-t "README aponta para v2.2.1" bash -c 'grep -q "v2.2.1/baseline.sh" README.md && ! grep -q "v2.2.0/baseline" README.md'
+t "texto da release traz os dois sha256" bash -c 'for f in baseline.sh baseline-verify.sh; do h=$(sha256sum "$f" | cut -d" " -f1); grep -q "$h" docs/release-v2.2.2.md || exit 1; done'
+t "README aponta para v2.2.2" bash -c 'grep -q "v2.2.2/baseline.sh" README.md && ! grep -q "v2.2.0/baseline" README.md'
 
 sec "sshd real (tests/integracao.sh)"
 if command -v sshd >/dev/null 2>&1 && command -v ssh >/dev/null 2>&1; then
